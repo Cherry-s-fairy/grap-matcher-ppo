@@ -1,0 +1,1512 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.claude/settings.local.json
+configs/__init__.py
+configs/params.py
+core/__init__.py
+core/mobility.py
+core/task_shaping.py
+doc/prompt.md
+env/__init__.py
+env/uav_env.py
+main.py
+models/__init__.py
+models/gnn_policy.py
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".claude/settings.local.json">
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)"
+    ]
+  }
+}
+</file>
+
+<file path="configs/__init__.py">
+
+</file>
+
+<file path="configs/params.py">
+# configs/params.py
+# Simulation and training hyperparameters
+
+# --- UAV Fleet ---
+NUM_UAVS = 6
+
+# Each UAV is defined by (cpu_capacity, bandwidth_mbps, battery_pct)
+# Heterogeneous by design: mix of high-compute, high-bandwidth, balanced nodes
+UAV_PROFILES = [
+    {"id": 0, "cpu": 8.0,  "bw": 100.0, "battery": 1.0},   # edge-server class
+    {"id": 1, "cpu": 4.0,  "bw": 50.0,  "battery": 0.9},   # mid-tier
+    {"id": 2, "cpu": 4.0,  "bw": 80.0,  "battery": 0.85},  # high-bandwidth
+    {"id": 3, "cpu": 2.0,  "bw": 30.0,  "battery": 0.95},  # lightweight
+    {"id": 4, "cpu": 2.0,  "bw": 20.0,  "battery": 0.7},   # low-resource
+    {"id": 5, "cpu": 6.0,  "bw": 60.0,  "battery": 0.8},   # balanced
+]
+
+# --- Task Graph ---
+MAX_TASK_NODES = 10          # maximum nodes in the DAG
+MIN_TASK_NODES = 3
+TASK_CPU_DEMAND_RANGE = (0.5, 4.0)   # CPU units demanded per task
+TASK_DATA_SIZE_RANGE  = (0.5, 5.0)   # MB per task edge (UAV sensing payloads)
+
+# --- Task Shaping ---
+SHAPING_SPLIT_THRESHOLD   = 0.8   # latency ratio that triggers node splitting
+SHAPING_MERGE_THRESHOLD   = 0.3   # success-rate below which nodes are merged
+MAX_SHAPING_STEPS         = 3     # max topology edits per episode step
+
+# --- Scheduling / Matching ---
+DEADLINE_MS           = 1000.0  # end-to-end latency deadline (ms)
+TRANSFER_LATENCY_BASE = 5.0     # base transfer ms per MB (static fallback)
+
+# --- RL Training ---
+MAX_EPISODE_STEPS   = 50
+GAMMA               = 0.99
+LR                  = 3e-4
+CLIP_EPS            = 0.2      # PPO clip epsilon
+ENTROPY_COEF        = 0.01
+VALUE_LOSS_COEF     = 0.5
+PPO_EPOCHS          = 4
+BATCH_SIZE          = 64
+ROLLOUT_STEPS       = 256
+TOTAL_TIMESTEPS     = 200_000
+
+# --- UAV Mobility (Random Waypoint Model) ---
+AREA_SIZE_M      = 600.0    # simulation arena (m × m) — keeps most pairs within COMM_RANGE
+UAV_SPEED_MPS    = 15.0     # cruise speed (m/s)
+SIM_STEP_S       = 0.5      # wall-clock seconds per RL step
+COMM_RANGE_M     = 400.0    # maximum communication range (m)
+BW_HALF_DIST_M   = 150.0    # distance at which link BW halves (m)
+# BW values are calibrated to TRANSFER_LATENCY_BASE (5 ms/MB → ~1600 Mbps effective).
+# BW_MAX matches the static baseline; BW_MIN creates a ~8× latency penalty at range.
+BW_MAX_MBPS      = 1600.0   # peak link bandwidth (Mbps) — consistent with static baseline
+BW_MIN_MBPS      = 200.0    # floor bandwidth for in-range links (Mbps)
+
+# --- Heterogeneous Energy Constraints ---
+# Battery is tracked as a fraction in [0, 1]; cost per step is subtracted each RL step.
+ENERGY_CPU_COEF   = 0.003   # battery fraction per CPU-unit consumed
+ENERGY_TX_COEF    = 0.0002  # battery fraction per MB transmitted
+BATTERY_LOW_RATIO = 0.20    # below this, UAV enters low-power mode (50 % CPU)
+BATTERY_DEAD_RATIO= 0.0     # UAV is offline when battery reaches this value
+
+# --- GNN ---
+GNN_HIDDEN_DIM  = 64
+GNN_NUM_LAYERS  = 2
+EMBED_DIM       = 32           # final per-node embedding size
+</file>
+
+<file path="core/__init__.py">
+
+</file>
+
+<file path="core/mobility.py">
+# core/mobility.py
+"""
+UAV Mobility and Heterogeneous Energy Model
+-------------------------------------------
+Implements a Random Waypoint mobility model within a bounded 2-D arena.
+Each UAV moves toward a randomly chosen waypoint; upon arrival a new
+waypoint is selected.  Battery is consumed by both computation and
+wireless transmission.
+
+Key outputs consumed by the environment:
+  - bandwidth_matrix()  : (N, N) float32 — current inter-UAV link BW (Mbps)
+  - node_features()     : (N, 3) float32 — dynamic [cpu_ratio, avg_bw_ratio, battery_ratio]
+  - effective_cpu()     : (N,)  float32  — CPU capacity after low-battery derating
+  - min_active_link_bw(): float           — weakest link among active-UAV pairs
+
+Academic motivation
+-------------------
+Static resource-graph assumptions are violated in real UAV swarms because:
+  1. Mobility causes time-varying link bandwidths → inter-task transfer
+     latency is non-stationary.
+  2. Heterogeneous battery depletion shrinks the effective fleet over time.
+  3. The Task Shaping agent must learn to MERGE tasks whose communication
+     partners have weak links, and SPLIT tasks on high-CPU nodes before
+     those nodes deplete their batteries — behaviours that cannot emerge
+     in static environments.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from configs.params import (
+    NUM_UAVS,
+    UAV_PROFILES,
+    AREA_SIZE_M,
+    UAV_SPEED_MPS,
+    SIM_STEP_S,
+    COMM_RANGE_M,
+    BW_HALF_DIST_M,
+    BW_MAX_MBPS,
+    BW_MIN_MBPS,
+    ENERGY_CPU_COEF,
+    ENERGY_TX_COEF,
+    BATTERY_LOW_RATIO,
+)
+
+
+class UAVMobilityModel:
+    """
+    Random Waypoint mobility + heterogeneous energy model for a UAV swarm.
+
+    State
+    -----
+    positions  : (N, 2) float32  — current XY position in [0, AREA_SIZE_M]²
+    waypoints  : (N, 2) float32  — current movement target
+    battery    : (N,)  float32  — remaining energy fraction in [0, 1]
+
+    Usage
+    -----
+    mob = UAVMobilityModel(rng=np.random.default_rng(42))
+    mob.reset()
+    for step in episode:
+        bw = mob.bandwidth_matrix()        # read before step to get current state
+        feats = mob.node_features()
+        mob.consume_energy(cpu_alloc, tx_mb)   # deduct energy from scheduling
+        mob.step()                             # advance positions
+    """
+
+    def __init__(self, rng: np.random.Generator | None = None):
+        self._rng = rng or np.random.default_rng()
+        self._n   = NUM_UAVS
+
+        # Static per-profile CPU and BW ceilings (used for normalisation)
+        self._cpu_cap = np.array([p["cpu"] for p in UAV_PROFILES], dtype=np.float32)
+        self._init_battery = np.array([p["battery"] for p in UAV_PROFILES], dtype=np.float32)
+
+        # Mutable state (initialised by reset)
+        self.positions = np.zeros((self._n, 2), dtype=np.float32)
+        self.waypoints = np.zeros((self._n, 2), dtype=np.float32)
+        self.battery   = np.zeros(self._n, dtype=np.float32)
+
+        self.reset()
+
+    # ------------------------------------------------------------------
+    def reset(self) -> "UAVMobilityModel":
+        """Randomise positions/waypoints; restore battery to profile values."""
+        self.positions = self._rng.uniform(0, AREA_SIZE_M, size=(self._n, 2)).astype(np.float32)
+        self.waypoints = self._rng.uniform(0, AREA_SIZE_M, size=(self._n, 2)).astype(np.float32)
+        self.battery   = self._init_battery.copy()
+        return self
+
+    # ------------------------------------------------------------------
+    def step(self) -> None:
+        """
+        Advance each active UAV one simulation tick (SIM_STEP_S seconds)
+        toward its current waypoint.  A new waypoint is drawn on arrival.
+        Depleted UAVs stay in place.
+        """
+        step_dist = UAV_SPEED_MPS * SIM_STEP_S
+        for i in range(self._n):
+            if self.battery[i] <= 0.0:
+                continue                         # offline: no movement
+            direction = self.waypoints[i] - self.positions[i]
+            dist = float(np.linalg.norm(direction))
+            if dist <= step_dist:
+                self.positions[i] = self.waypoints[i].copy()
+                self.waypoints[i] = self._rng.uniform(0, AREA_SIZE_M, size=2).astype(np.float32)
+            else:
+                self.positions[i] += (direction / dist) * step_dist
+
+    # ------------------------------------------------------------------
+    def consume_energy(
+        self,
+        cpu_alloc: np.ndarray,
+        tx_mb: np.ndarray,
+    ) -> None:
+        """
+        Deduct battery based on computation and transmission load.
+
+        Parameters
+        ----------
+        cpu_alloc : (N,) — CPU units consumed per UAV this scheduling round
+        tx_mb     : (N,) — MB transmitted per UAV this scheduling round
+        """
+        delta = ENERGY_CPU_COEF * cpu_alloc + ENERGY_TX_COEF * tx_mb
+        self.battery = np.clip(self.battery - delta, 0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    def bandwidth_matrix(self) -> np.ndarray:
+        """
+        Compute the (N, N) pairwise link-bandwidth matrix.
+
+        Model: exponential decay with distance
+            BW(d) = BW_MIN + (BW_MAX - BW_MIN) * exp(-d / BW_HALF_DIST)
+        Links to/from depleted UAVs are set to 0.
+
+        Returns
+        -------
+        bw : (N, N) float32  — bandwidth in Mbps; diagonal = 0
+        """
+        bw = np.zeros((self._n, self._n), dtype=np.float32)
+        bw_range = BW_MAX_MBPS - BW_MIN_MBPS
+
+        for i in range(self._n):
+            if self.battery[i] <= 0.0:
+                continue
+            for j in range(self._n):
+                if i == j or self.battery[j] <= 0.0:
+                    continue
+                d = float(np.linalg.norm(self.positions[i] - self.positions[j]))
+                if d > COMM_RANGE_M:
+                    bw[i, j] = BW_MIN_MBPS          # out-of-range floor
+                else:
+                    bw[i, j] = BW_MIN_MBPS + bw_range * float(
+                        np.exp(-d / BW_HALF_DIST_M)
+                    )
+        return bw
+
+    # ------------------------------------------------------------------
+    def effective_cpu(self) -> np.ndarray:
+        """
+        Return effective CPU capacity per UAV after low-battery derating.
+
+        UAVs below BATTERY_LOW_RATIO enter low-power mode (50 % CPU).
+        Depleted UAVs (battery = 0) contribute 0 CPU.
+
+        Returns
+        -------
+        (N,) float32
+        """
+        eff = self._cpu_cap.copy()
+        low_power = (self.battery > 0.0) & (self.battery < BATTERY_LOW_RATIO)
+        depleted  = self.battery <= 0.0
+        eff[low_power] *= 0.5
+        eff[depleted]   = 0.0
+        return eff
+
+    # ------------------------------------------------------------------
+    def node_features(self) -> np.ndarray:
+        """
+        Build dynamic per-UAV feature matrix for the resource graph GNN.
+
+        Features (all normalised to [0, 1]):
+          col 0 — effective_cpu / max_cpu_cap  : compute availability
+          col 1 — mean link BW to active peers / BW_MAX_MBPS : connectivity
+          col 2 — battery remaining fraction   : energy state
+
+        Returns
+        -------
+        (N, 3) float32
+        """
+        bw_matrix = self.bandwidth_matrix()                      # (N, N)
+        eff_cpu   = self.effective_cpu()                         # (N,)
+
+        # Mean BW to active peers (exclude self and depleted UAVs)
+        active_mask = (self.battery > 0.0).astype(np.float32)   # (N,)
+        peer_count  = max(active_mask.sum() - 1.0, 1.0)
+        avg_bw      = bw_matrix.sum(axis=1) / peer_count        # (N,)
+
+        features = np.stack([
+            eff_cpu / max(self._cpu_cap.max(), 1e-6),
+            avg_bw  / BW_MAX_MBPS,
+            self.battery,
+        ], axis=1).astype(np.float32)                            # (N, 3)
+
+        return features
+
+    # ------------------------------------------------------------------
+    def min_active_link_bw(self) -> float:
+        """
+        Return the minimum bandwidth among all active-UAV pairs.
+        Used as a feedback signal to trigger merge when links are weak.
+
+        Returns 0.0 if fewer than 2 UAVs are active.
+        """
+        bw = self.bandwidth_matrix()
+        active = self.battery > 0.0
+        if active.sum() < 2:
+            return 0.0
+        # Only consider pairs where both ends are active
+        mask = np.outer(active, active)
+        np.fill_diagonal(mask, False)
+        active_bw = bw[mask]
+        return float(active_bw.min()) if len(active_bw) > 0 else 0.0
+</file>
+
+<file path="core/task_shaping.py">
+# core/task_shaping.py
+"""
+Adaptive Task Shaping
+---------------------
+Observes feedback from the previous scheduling round (latency ratio,
+success rate, reschedule count) and mutates the Task Graph DAG topology
+to make future matching easier / more efficient.
+
+Two primitive operations are supported:
+  - split_node  : decompose a heavy task into two lighter sub-tasks
+  - merge_nodes : collapse two lightweight parallel tasks into one
+
+These primitives are intentionally simple so the RL agent can learn
+*when* to apply them via the action space rather than hard-coding policy.
+"""
+
+from __future__ import annotations
+
+import copy
+import random
+from typing import Dict, List, Tuple
+
+import networkx as nx
+
+from configs.params import (
+    MAX_TASK_NODES,
+    SHAPING_MERGE_THRESHOLD,
+    SHAPING_SPLIT_THRESHOLD,
+    MAX_SHAPING_STEPS,
+)
+
+
+# ---------------------------------------------------------------------------
+# Feedback dataclass
+# ---------------------------------------------------------------------------
+
+class SchedulingFeedback:
+    """
+    Carries performance signals from the previous matching step.
+
+    Attributes
+    ----------
+    latency_ratio       : achieved_latency / deadline  (>1.0 means deadline missed)
+    success_rate        : fraction of tasks successfully offloaded in [0, 1]
+    reschedule_count    : number of tasks that had to be rescheduled
+    avg_uav_utilization : fraction of total UAV CPU capacity consumed in [0, 1]
+                          High value → fleet is heavily loaded → agent should consider merge
+    """
+
+    def __init__(
+        self,
+        latency_ratio: float = 0.0,
+        success_rate: float = 1.0,
+        reschedule_count: int = 0,
+        avg_uav_utilization: float = 0.0,
+        min_link_bw_ratio: float = 1.0,
+    ):
+        self.latency_ratio       = float(latency_ratio)
+        self.success_rate        = float(success_rate)
+        self.reschedule_count    = int(reschedule_count)
+        self.avg_uav_utilization = float(avg_uav_utilization)
+        # min_link_bw_ratio: weakest active link / BW_MAX_MBPS ∈ [0, 1]
+        # Low value → topology is fragmented → merge tasks to cut cross-link traffic
+        self.min_link_bw_ratio   = float(min_link_bw_ratio)
+
+    def as_vector(self) -> List[float]:
+        """Return a fixed-length (5) feature vector for use as RL state input."""
+        return [
+            self.latency_ratio,
+            self.success_rate,
+            float(self.reschedule_count),
+            self.avg_uav_utilization,
+            self.min_link_bw_ratio,
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Core shaping logic
+# ---------------------------------------------------------------------------
+
+class AdaptiveTaskShaper:
+    """
+    Stateless transformer that applies topology mutations to a Task DAG.
+
+    The RL environment calls `shape(graph, feedback, action)` each step.
+    The `action` integer selects which primitive (or no-op) to apply.
+
+    Action space (discrete):
+        0 — no-op
+        1 — split the most CPU-heavy node
+        2 — merge two CPU-lightest parallel leaf nodes
+    """
+
+    ACTION_NOOP  = 0
+    ACTION_SPLIT = 1
+    ACTION_MERGE = 2
+    NUM_ACTIONS  = 3
+
+    # ------------------------------------------------------------------
+    def shape(
+        self,
+        graph: nx.DiGraph,
+        feedback: SchedulingFeedback,
+        action: int,
+    ) -> Tuple[nx.DiGraph, Dict]:
+        """
+        Apply the chosen shaping action and return the mutated graph
+        together with a dict of metadata (for logging / reward shaping).
+
+        Returns
+        -------
+        new_graph : nx.DiGraph  — mutated copy (original is never modified)
+        info      : dict        — {'action_taken': str, 'delta_nodes': int}
+        """
+        g = copy.deepcopy(graph)
+        info: Dict = {"action_taken": "noop", "delta_nodes": 0}
+
+        if action == self.ACTION_SPLIT:
+            g, info = self._try_split(g, feedback)
+        elif action == self.ACTION_MERGE:
+            g, info = self._try_merge(g, feedback)
+
+        return g, info
+
+    # ------------------------------------------------------------------
+    # Heuristic: rule-based suggestions (used by wrapper / curriculum)
+    # ------------------------------------------------------------------
+
+    def suggest_action(self, feedback: SchedulingFeedback) -> int:
+        """
+        Heuristic to bootstrap training.  Priority order:
+
+          1. Link quality collapse (mobility) → merge to cut cross-UAV traffic
+             When min_link_bw_ratio < 0.15, inter-UAV data transfers dominate
+             latency; merging tasks collocates computation, eliminating those
+             transfers entirely.
+
+          2. Fleet saturated (high util + low success) → merge to ease scheduling
+
+          3. Deadline pressure but fleet has headroom → split to expose parallelism
+
+          4. Success rate collapsed (energy depletion / over-subscription) → merge
+
+          5. Otherwise no-op
+
+        The RL agent is expected to discover superior policies beyond this heuristic.
+        """
+        # Topology-aware: weak links dominate transfer latency → merge
+        if feedback.min_link_bw_ratio < 0.15:
+            return self.ACTION_MERGE
+
+        # Resource-aware: fleet is saturated → reduce task granularity
+        if (feedback.avg_uav_utilization > 0.85
+                and feedback.success_rate < 0.8):
+            return self.ACTION_MERGE
+
+        # Latency-aware: deadline pressure → split heavy node to expose parallelism
+        if feedback.latency_ratio > SHAPING_SPLIT_THRESHOLD:
+            return self.ACTION_SPLIT
+
+        # Success-aware: many tasks failing → fleet overwhelmed → merge
+        if feedback.success_rate < SHAPING_MERGE_THRESHOLD:
+            return self.ACTION_MERGE
+
+        return self.ACTION_NOOP
+
+    # ------------------------------------------------------------------
+    # Primitive: split
+    # ------------------------------------------------------------------
+
+    def _try_split(
+        self, g: nx.DiGraph, feedback: SchedulingFeedback
+    ) -> Tuple[nx.DiGraph, Dict]:
+        """
+        Find the node with the highest CPU demand and split it into two
+        child nodes with half the CPU demand each, preserving all edges.
+        """
+        if len(g.nodes) >= MAX_TASK_NODES:
+            return g, {"action_taken": "split_skipped_max", "delta_nodes": 0}
+
+        # pick heaviest node
+        target = max(g.nodes, key=lambda n: g.nodes[n].get("cpu", 0.0))
+        cpu = g.nodes[target]["cpu"]
+        data_size = g.nodes[target].get("data_size", 1.0)
+
+        # new node ids
+        new_id = max(g.nodes) + 1
+        child_a, child_b = target, new_id
+
+        # update target in place (becomes child_a)
+        g.nodes[child_a]["cpu"]       = cpu / 2.0
+        g.nodes[child_a]["data_size"] = data_size / 2.0
+
+        # add child_b
+        g.add_node(
+            child_b,
+            cpu=cpu / 2.0,
+            data_size=data_size / 2.0,
+        )
+
+        # child_a → child_b (sequential dependency)
+        g.add_edge(child_a, child_b, transfer_mb=data_size / 2.0)
+
+        # re-attach child_b to all original successors of child_a
+        for succ in list(g.successors(child_a)):
+            if succ != child_b:
+                g.add_edge(child_b, succ, transfer_mb=g[child_a][succ].get("transfer_mb", 1.0))
+                g.remove_edge(child_a, succ)
+
+        return g, {"action_taken": "split", "delta_nodes": 1}
+
+    # ------------------------------------------------------------------
+    # Primitive: merge
+    # ------------------------------------------------------------------
+
+    def _try_merge(
+        self, g: nx.DiGraph, feedback: SchedulingFeedback
+    ) -> Tuple[nx.DiGraph, Dict]:
+        """
+        Find two parallel leaf nodes (no successors) with the lowest
+        combined CPU demand and merge them into one.
+        """
+        leaves = [n for n in g.nodes if g.out_degree(n) == 0]
+        if len(leaves) < 2:
+            return g, {"action_taken": "merge_skipped_no_leaves", "delta_nodes": 0}
+
+        # sort by cpu ascending, pick two cheapest
+        leaves.sort(key=lambda n: g.nodes[n].get("cpu", 0.0))
+        a, b = leaves[0], leaves[1]
+
+        merged_cpu       = g.nodes[a].get("cpu", 0.0) + g.nodes[b].get("cpu", 0.0)
+        merged_data_size = g.nodes[a].get("data_size", 1.0) + g.nodes[b].get("data_size", 1.0)
+
+        # keep node a, update attributes
+        g.nodes[a]["cpu"]       = merged_cpu
+        g.nodes[a]["data_size"] = merged_data_size
+
+        # redirect all predecessors of b to a
+        for pred in list(g.predecessors(b)):
+            if pred != a:
+                g.add_edge(pred, a, transfer_mb=g[pred][b].get("transfer_mb", 1.0))
+
+        g.remove_node(b)
+
+        return g, {"action_taken": "merge", "delta_nodes": -1}
+
+
+# ---------------------------------------------------------------------------
+# Utility: generate a random DAG for episode initialisation
+# ---------------------------------------------------------------------------
+
+def generate_random_task_dag(
+    num_nodes: int,
+    rng: random.Random | None = None,
+) -> nx.DiGraph:
+    """
+    Build a random DAG with `num_nodes` tasks.
+    Edges go from lower to higher node id to guarantee acyclicity.
+    """
+    from configs.params import TASK_CPU_DEMAND_RANGE, TASK_DATA_SIZE_RANGE
+
+    rng = rng or random.Random()
+    g = nx.DiGraph()
+
+    for i in range(num_nodes):
+        g.add_node(
+            i,
+            cpu=rng.uniform(*TASK_CPU_DEMAND_RANGE),
+            data_size=rng.uniform(*TASK_DATA_SIZE_RANGE),
+        )
+
+    # random edges (guaranteed DAG: only i→j with i<j)
+    for i in range(num_nodes):
+        for j in range(i + 1, num_nodes):
+            if rng.random() < 0.3:
+                g.add_edge(
+                    i, j,
+                    transfer_mb=rng.uniform(*TASK_DATA_SIZE_RANGE),
+                )
+
+    # ensure connectivity: chain 0→1→2→...
+    for i in range(num_nodes - 1):
+        if not g.has_edge(i, i + 1):
+            g.add_edge(i, i + 1, transfer_mb=rng.uniform(*TASK_DATA_SIZE_RANGE))
+
+    return g
+</file>
+
+<file path="doc/prompt.md">
+# Role
+You are a Senior Research Engineer specializing in Deep Reinforcement Learning (DRL) and Distributed Systems (UAV Cloud-Edge Coordination).
+
+# Task
+Help me scaffold a Python research project for a paper. The core idea is "Resource-Aware Task Graph Shaping and Matching in Heterogeneous UAV Swarms." 
+
+# Key Innovation to Implement
+A feedback loop where the Task Graph generation phase perceives the Resource Graph (UAV status) and previous matching performance (latency, success rate) to optimize the Task Graph's topology (granularity/dependency) for better scheduling.
+
+# Technical Requirements
+1. Framework: OpenAI Gymnasium for the RL environment.
+2. Graph Processing: PyTorch Geometric (PyG) or NetworkX for handling Task Graphs (DAG) and Resource Graphs.
+3. RL Algorithm: Use a Placeholder for PPO or a GNN-based Actor-Critic model.
+4. Heterogeneity: UAVs must have different CPU, Bandwidth, and Battery attributes.
+
+# Project Structure Request
+Please generate the following file structure and core code:
+1. `env/uav_env.py`: A Gymnasium environment that handles the state (Task Graph + Resource Graph) and step logic.
+2. `models/gnn_policy.py`: A GNN-based feature extractor (using GraphConv or SageConv) to embed the two graphs.
+3. `core/task_shaping.py`: The logic for "Adaptive Task Shaping" (how task nodes are modified based on feedback).
+4. `configs/params.py`: Configuration for UAV heterogeneity and simulation constants.
+5. `main.py`: A simple training loop to demonstrate the flow.
+
+# Specific Logic Focus
+Ensure the 'State' includes the results of the previous matching (Reschedule count, Latency) so the agent can learn to 'shape' the next task graph better.
+</file>
+
+<file path="env/__init__.py">
+
+</file>
+
+<file path="env/uav_env.py">
+# env/uav_env.py
+"""
+UAVTaskEnv — Gymnasium environment for Resource-Aware Task Graph Shaping
+in Heterogeneous UAV Swarms.
+
+Episode flow
+------------
+1. reset()   : sample a random Task DAG + fixed heterogeneous Resource Graph.
+               Feedback is initialised to zeros.
+2. step(a)   : apply shaping action → greedy-match tasks to UAVs
+               → compute reward → update feedback state.
+3. Repeat until deadline exceeded or max steps reached.
+
+Observation (dict)
+------------------
+  task_x    : (N_t, 2)   node features [cpu_demand, data_size]  — padded to MAX_TASK_NODES
+  task_edge : (2, E_t)   COO edge index of the task DAG
+  task_batch: (N_t,)     all zeros (single graph per env step)
+  res_x     : (N_r, 3)   [cpu_cap, bandwidth, battery]
+  res_edge  : (2, E_r)   fully-connected resource graph edges
+  res_batch : (N_r,)     all zeros
+  feedback  : (3,)       [latency_ratio, success_rate, reschedule_count]
+
+Action space
+------------
+Discrete(3):  0=noop, 1=split heaviest node, 2=merge two cheapest leaves
+
+Reward
+------
+  +1   for each task matched within deadline
+  -0.5 for each reschedule
+  -1   if total latency exceeds deadline
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import networkx as nx
+import gymnasium as gym
+from gymnasium import spaces
+
+import torch
+
+from configs.params import (
+    NUM_UAVS,
+    UAV_PROFILES,
+    MAX_TASK_NODES,
+    DEADLINE_MS,
+    TRANSFER_LATENCY_BASE,
+    MAX_EPISODE_STEPS,
+    BW_MAX_MBPS,
+    BW_MIN_MBPS,
+)
+from core.task_shaping import (
+    AdaptiveTaskShaper,
+    SchedulingFeedback,
+    generate_random_task_dag,
+)
+from core.mobility import UAVMobilityModel
+
+
+# ---------------------------------------------------------------------------
+# Greedy matching / scheduling  (placeholder for learned matcher)
+# ---------------------------------------------------------------------------
+
+def greedy_match(
+    task_graph: nx.DiGraph,
+    eff_cpu: np.ndarray,                # (N,) effective CPU per UAV (after derating)
+    bw_matrix: Optional[np.ndarray] = None,  # (N, N) link BW in Mbps; None → use base
+) -> Tuple[float, float, int, float, np.ndarray, np.ndarray]:
+    """
+    Topological-order greedy assignment with mobility-aware transfer latency.
+
+    CPU is consumed per assignment within one scheduling round.  Transfer
+    latency is computed from the actual bandwidth between the UAV running a
+    predecessor task and the UAV running its successor — making it sensitive
+    to the current topology.
+
+    Parameters
+    ----------
+    task_graph : DAG of tasks
+    eff_cpu    : (N,) effective CPU capacity per UAV (accounts for low-battery derating)
+    bw_matrix  : (N, N) current link bandwidths in Mbps.  If None, falls back to
+                 TRANSFER_LATENCY_BASE (backward-compatible static mode).
+
+    Returns
+    -------
+    latency_ms      : makespan of the schedule (ms)
+    success_rate    : fraction of tasks that executed successfully
+    reschedule_count: tasks that had to be force-assigned to an overloaded UAV
+    avg_utilization : fraction of total effective fleet CPU consumed
+    cpu_per_uav     : (N,) CPU units consumed per UAV — fed to energy model
+    tx_per_uav      : (N,) MB transmitted per UAV    — fed to energy model
+    """
+    N = len(eff_cpu)
+    capacity  = {i: float(eff_cpu[i]) for i in range(N)}
+    remaining = dict(capacity)
+    assignments: Dict[int, int] = {}    # task_node → uav_id
+    task_finish: Dict[int, float] = {}
+    reschedule_count = 0
+    failed = 0
+
+    # Per-UAV energy accounting
+    cpu_per_uav = np.zeros(N, dtype=np.float32)
+    tx_per_uav  = np.zeros(N, dtype=np.float32)
+
+    try:
+        order = list(nx.topological_sort(task_graph))
+    except nx.NetworkXUnfeasible:
+        return DEADLINE_MS * 2, 0.0, len(task_graph), 1.0, cpu_per_uav, tx_per_uav
+
+    for node in order:
+        cpu_demand = task_graph.nodes[node].get("cpu", 1.0)
+
+        # Earliest start: wait for all predecessors to finish
+        pred_finish = max(
+            (task_finish.get(p, 0.0) for p in task_graph.predecessors(node)),
+            default=0.0,
+        )
+
+        # candidates: active UAVs (eff_cpu > 0) with enough remaining budget
+        candidates = sorted(
+            [(uid, cap) for uid, cap in remaining.items()
+             if cap >= cpu_demand and capacity[uid] > 0.0],
+            key=lambda x: -x[1],
+        )
+
+        if not candidates:
+            reschedule_count += 1
+            # Fall back to least-degraded active UAV
+            active = {uid: cap for uid, cap in remaining.items() if capacity[uid] > 0.0}
+            if not active:
+                failed += 1
+                task_finish[node] = pred_finish
+                continue
+            best_uid = max(active, key=lambda u: active[u])
+            avail = remaining[best_uid]
+            if avail < cpu_demand * 0.5:
+                failed += 1
+                task_finish[node] = pred_finish
+                continue
+            exec_ms = cpu_demand / max(avail, 0.01) * 100
+        else:
+            best_uid = candidates[0][0]
+            exec_ms  = cpu_demand / remaining[best_uid] * 100
+
+        # Transfer latency: use actual link BW between predecessor UAV and this UAV
+        transfer_ms = 0.0
+        for pred in task_graph.predecessors(node):
+            transfer_mb = task_graph[pred][node].get("transfer_mb", 1.0)
+            pred_uav = assignments.get(pred)
+            if bw_matrix is not None and pred_uav is not None:
+                bw = float(bw_matrix[pred_uav, best_uid])
+                # latency (ms) = data (MB) / bandwidth (Mbps) * 1000
+                transfer_ms += (transfer_mb / max(bw, BW_MIN_MBPS)) * 1000.0
+            else:
+                transfer_ms += transfer_mb * TRANSFER_LATENCY_BASE
+            tx_per_uav[best_uid] += transfer_mb
+
+        remaining[best_uid]  = max(remaining[best_uid] - cpu_demand, 0.0)
+        cpu_per_uav[best_uid] += cpu_demand
+        assignments[node]    = best_uid
+        task_finish[node]    = pred_finish + transfer_ms + exec_ms
+
+    total_latency = max(task_finish.values(), default=0.0)
+    success_rate  = (len(task_graph) - failed) / max(len(task_graph), 1)
+
+    total_cap   = sum(c for c in capacity.values() if c > 0)
+    total_used  = sum(capacity[uid] - remaining[uid] for uid in capacity)
+    avg_util    = min(total_used / max(total_cap, 1e-6), 1.0)
+
+    return total_latency, success_rate, reschedule_count, avg_util, cpu_per_uav, tx_per_uav
+
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+class UAVTaskEnv(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        num_task_nodes: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
+        super().__init__()
+        self._rng    = random.Random(seed)
+        self._np_rng = np.random.default_rng(seed)
+
+        self._num_task_nodes = num_task_nodes  # None → random each episode
+        self._shaper  = AdaptiveTaskShaper()
+        self._mobility = UAVMobilityModel(rng=self._np_rng)
+
+        N  = MAX_TASK_NODES
+        Nr = NUM_UAVS
+
+        self.observation_space = spaces.Dict({
+            "task_x":    spaces.Box(0.0, 10.0, shape=(N, 2),      dtype=np.float32),
+            "task_edge": spaces.Box(0,   N,    shape=(2, N * N),   dtype=np.int64),
+            "task_batch":spaces.Box(0,   0,    shape=(N,),         dtype=np.int64),
+            # res_x is now DYNAMIC: [eff_cpu_ratio, avg_bw_ratio, battery_ratio]
+            "res_x":     spaces.Box(0.0, 1.0,  shape=(Nr, 3),     dtype=np.float32),
+            "res_edge":  spaces.Box(0,   Nr,   shape=(2, Nr * Nr), dtype=np.int64),
+            "res_batch": spaces.Box(0,   0,    shape=(Nr,),        dtype=np.int64),
+            # feedback: 5 signals including min_link_bw_ratio (mobility-aware)
+            "feedback":  spaces.Box(-np.inf, np.inf, shape=(5,),  dtype=np.float32),
+        })
+        self.action_space = spaces.Discrete(AdaptiveTaskShaper.NUM_ACTIONS)
+
+        # episode state
+        self._task_graph: nx.DiGraph = nx.DiGraph()
+        self._feedback   = SchedulingFeedback()
+        self._step_count = 0
+
+    # ------------------------------------------------------------------
+    def reset(
+        self,
+        *,
+        seed: Optional[int] = None,
+        options: Optional[Dict] = None,
+    ) -> Tuple[Dict, Dict]:
+        super().reset(seed=seed)
+        if seed is not None:
+            self._rng    = random.Random(seed)
+            self._np_rng = np.random.default_rng(seed)
+            self._mobility = UAVMobilityModel(rng=self._np_rng)
+
+        n = self._num_task_nodes or self._rng.randint(3, MAX_TASK_NODES)
+        self._task_graph = generate_random_task_dag(n, rng=self._rng)
+        self._mobility.reset()
+        self._feedback   = SchedulingFeedback()
+        self._step_count = 0
+
+        return self._get_obs(), {}
+
+    # ------------------------------------------------------------------
+    def step(self, action: int) -> Tuple[Dict, float, bool, bool, Dict]:
+        self._step_count += 1
+
+        # 1. Shape the task graph
+        self._task_graph, shape_info = self._shaper.shape(
+            self._task_graph, self._feedback, int(action)
+        )
+
+        # 2. Read current mobility state
+        bw_matrix = self._mobility.bandwidth_matrix()   # (N, N) Mbps
+        eff_cpu   = self._mobility.effective_cpu()      # (N,) derated CPU
+
+        # 3. Greedy matching with mobility-aware transfer latency
+        latency, success_rate, reschedule_count, avg_util, cpu_used, tx_used = greedy_match(
+            self._task_graph, eff_cpu, bw_matrix
+        )
+
+        # 4. Deduct energy from the fleet based on this scheduling round
+        self._mobility.consume_energy(cpu_used, tx_used)
+
+        # 5. Advance UAV positions for next step
+        self._mobility.step()
+
+        # 6. Update feedback — now includes topology (link BW) signal
+        latency_ratio    = latency / DEADLINE_MS
+        min_bw_ratio     = self._mobility.min_active_link_bw() / BW_MAX_MBPS
+        self._feedback = SchedulingFeedback(
+            latency_ratio=latency_ratio,
+            success_rate=success_rate,
+            reschedule_count=reschedule_count,
+            avg_uav_utilization=avg_util,
+            min_link_bw_ratio=min_bw_ratio,
+        )
+
+        # 7. Reward
+        reward = self._compute_reward(latency, success_rate, reschedule_count)
+
+        # 8. Termination
+        terminated = latency > DEADLINE_MS * 2          # catastrophic failure
+        truncated  = self._step_count >= MAX_EPISODE_STEPS
+
+        info = {
+            "latency_ms":      latency,
+            "latency_ratio":   latency_ratio,
+            "success_rate":    success_rate,
+            "reschedule_count":reschedule_count,
+            "num_task_nodes":  len(self._task_graph),
+            **shape_info,
+        }
+        return self._get_obs(), reward, terminated, truncated, info
+
+    # ------------------------------------------------------------------
+    def _compute_reward(
+        self, latency: float, success_rate: float, reschedule_count: int
+    ) -> float:
+        r = success_rate * len(self._task_graph)        # +1 per matched task
+        r -= 0.5 * reschedule_count
+        if latency > DEADLINE_MS:
+            r -= 1.0
+        return float(r)
+
+    # ------------------------------------------------------------------
+    def _get_obs(self) -> Dict[str, np.ndarray]:
+        """Build the padded numpy observation dict."""
+        N  = MAX_TASK_NODES
+        Nr = NUM_UAVS
+        g  = self._task_graph
+
+        # --- task graph node features (padded) ---
+        task_x = np.zeros((N, 2), dtype=np.float32)
+        node_ids = sorted(g.nodes)
+        id_map   = {nid: i for i, nid in enumerate(node_ids)}
+        for nid in node_ids:
+            i = id_map[nid]
+            task_x[i, 0] = g.nodes[nid].get("cpu", 0.0)
+            task_x[i, 1] = g.nodes[nid].get("data_size", 0.0)
+
+        # --- task graph edges (COO, padded) ---
+        edges = [(id_map[u], id_map[v]) for u, v in g.edges]
+        max_edges = N * N
+        task_edge = np.zeros((2, max_edges), dtype=np.int64)
+        for k, (u, v) in enumerate(edges[:max_edges]):
+            task_edge[0, k] = u
+            task_edge[1, k] = v
+
+        task_batch = np.zeros(N, dtype=np.int64)
+
+        # --- resource graph node features (dynamic from mobility model) ---
+        # [eff_cpu_ratio, avg_link_bw_ratio, battery_ratio] — all ∈ [0, 1]
+        res_x = self._mobility.node_features()           # (Nr, 3)
+
+        # fully connected resource graph
+        res_edges = [(i, j) for i in range(Nr) for j in range(Nr) if i != j]
+        res_edge = np.zeros((2, Nr * Nr), dtype=np.int64)
+        for k, (u, v) in enumerate(res_edges):
+            res_edge[0, k] = u
+            res_edge[1, k] = v
+
+        res_batch = np.zeros(Nr, dtype=np.int64)
+
+        feedback = np.array(self._feedback.as_vector(), dtype=np.float32)
+
+        return {
+            "task_x":    task_x,
+            "task_edge": task_edge,
+            "task_batch":task_batch,
+            "res_x":     res_x,
+            "res_edge":  res_edge,
+            "res_batch": res_batch,
+            "feedback":  feedback,
+        }
+
+    # ------------------------------------------------------------------
+    def render(self):
+        pass
+</file>
+
+<file path="main.py">
+# main.py
+"""
+Training entry-point: Resource-Aware Task Graph Shaping in Heterogeneous UAV Swarms
+------------------------------------------------------------------------------------
+This script demonstrates the full training loop using a minimal hand-rolled
+PPO-style update.  To use Stable-Baselines3 instead, see the commented block
+at the bottom of this file.
+
+Run:
+    python main.py
+"""
+
+from __future__ import annotations
+
+import random
+import time
+from collections import deque
+from typing import List, Dict
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from configs.params import (
+    GAMMA,
+    LR,
+    CLIP_EPS,
+    ENTROPY_COEF,
+    VALUE_LOSS_COEF,
+    PPO_EPOCHS,
+    BATCH_SIZE,
+    ROLLOUT_STEPS,
+    TOTAL_TIMESTEPS,
+    MAX_EPISODE_STEPS,
+)
+from env.uav_env import UAVTaskEnv
+from models.gnn_policy import ActorCriticPolicy
+
+
+# ---------------------------------------------------------------------------
+# Helper: convert numpy obs dict → torch tensor dict
+# ---------------------------------------------------------------------------
+
+def obs_to_torch(obs: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
+    return {
+        k: torch.as_tensor(v, dtype=torch.float32 if v.dtype == np.float32 else torch.long).to(device)
+        for k, v in obs.items()
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rollout buffer (simplified, single env)
+# ---------------------------------------------------------------------------
+
+class RolloutBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.clear()
+
+    def clear(self):
+        self.obs: List[Dict[str, torch.Tensor]] = []
+        self.actions:    List[int]   = []
+        self.log_probs:  List[float] = []
+        self.rewards:    List[float] = []
+        self.values:     List[float] = []
+        self.dones:      List[bool]  = []
+
+    def add(self, obs, action, log_prob, reward, value, done):
+        self.obs.append(obs)
+        self.actions.append(action)
+        self.log_probs.append(log_prob)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.dones.append(done)
+
+    def __len__(self):
+        return len(self.actions)
+
+    def compute_returns(self, last_value: float, gamma: float) -> torch.Tensor:
+        returns = []
+        R = last_value
+        for r, done in zip(reversed(self.rewards), reversed(self.dones)):
+            R = r + gamma * R * (1.0 - float(done))
+            returns.insert(0, R)
+        return torch.tensor(returns, dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# PPO update step
+# ---------------------------------------------------------------------------
+
+def ppo_update(
+    policy: ActorCriticPolicy,
+    optimizer: optim.Optimizer,
+    buffer: RolloutBuffer,
+    last_value: float,
+    device: torch.device,
+):
+    returns    = buffer.compute_returns(last_value, GAMMA).to(device)
+    old_log_ps = torch.tensor(buffer.log_probs, dtype=torch.float32).to(device)
+    actions_t  = torch.tensor(buffer.actions,   dtype=torch.long).to(device)
+    values_t   = torch.tensor(buffer.values,    dtype=torch.float32).to(device)
+
+    advantages = (returns - values_t).detach()
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    for _ in range(PPO_EPOCHS):
+        # mini-batch (random indices)
+        idx = torch.randperm(len(buffer.actions))
+        for start in range(0, len(buffer.actions), BATCH_SIZE):
+            mb_idx = idx[start: start + BATCH_SIZE]
+
+            # rebuild obs batch (list of dicts → dict of stacked tensors)
+            # For single-graph env the batch dimension is 1 per step.
+            mb_obs_list = [buffer.obs[i] for i in mb_idx.tolist()]
+            mb_obs: Dict[str, torch.Tensor] = {}
+            for key in mb_obs_list[0]:
+                mb_obs[key] = torch.stack([o[key] for o in mb_obs_list], dim=0).to(device)
+
+            logits, new_values = policy(mb_obs)
+            dist = torch.distributions.Categorical(logits=logits)
+            new_log_ps = dist.log_prob(actions_t[mb_idx])
+            entropy    = dist.entropy().mean()
+
+            ratio      = (new_log_ps - old_log_ps[mb_idx]).exp()
+            adv_mb     = advantages[mb_idx]
+
+            surr1 = ratio * adv_mb
+            surr2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * adv_mb
+            actor_loss  = -torch.min(surr1, surr2).mean()
+            critic_loss = nn.functional.mse_loss(new_values.squeeze(-1), returns[mb_idx])
+
+            loss = actor_loss + VALUE_LOSS_COEF * critic_loss - ENTROPY_COEF * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+            optimizer.step()
+
+
+# ---------------------------------------------------------------------------
+# Main training loop
+# ---------------------------------------------------------------------------
+
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[main] Using device: {device}")
+
+    env    = UAVTaskEnv(seed=42)
+    policy = ActorCriticPolicy(action_dim=3, features_dim=128).to(device)
+    optim_ = optim.Adam(policy.parameters(), lr=LR)
+    buffer = RolloutBuffer(capacity=ROLLOUT_STEPS)
+
+    ep_rewards: deque = deque(maxlen=20)
+    ep_reward = 0.0
+    timestep  = 0
+    episode   = 0
+
+    obs_np, _ = env.reset()
+    obs = obs_to_torch(obs_np, device)
+
+    t0 = time.time()
+
+    while timestep < TOTAL_TIMESTEPS:
+        # ---- collect rollout ----
+        buffer.clear()
+        for _ in range(ROLLOUT_STEPS):
+            with torch.no_grad():
+                action, log_prob, _, value = policy.get_action_and_value(
+                    {k: v.unsqueeze(0) for k, v in obs.items()}
+                )
+
+            next_obs_np, reward, terminated, truncated, info = env.step(action.item())
+            done = terminated or truncated
+
+            buffer.add(obs, action.item(), log_prob.item(), reward, value.item(), done)
+            ep_reward += reward
+            timestep  += 1
+
+            if done:
+                ep_rewards.append(ep_reward)
+                episode += 1
+                if episode % 20 == 0:
+                    elapsed = time.time() - t0
+                    mean_r  = np.mean(ep_rewards)
+                    fps     = timestep / elapsed
+                    print(
+                        f"[ep {episode:5d} | step {timestep:7d}] "
+                        f"mean_reward={mean_r:7.2f}  fps={fps:.0f}  "
+                        f"latency={info['latency_ms']:.1f}ms  "
+                        f"nodes={info['num_task_nodes']}  "
+                        f"action={info['action_taken']}"
+                    )
+                ep_reward = 0.0
+                obs_np, _ = env.reset()
+                obs = obs_to_torch(obs_np, device)
+            else:
+                obs = obs_to_torch(next_obs_np, device)
+
+        # ---- PPO update ----
+        with torch.no_grad():
+            _, _, _, last_value = policy.get_action_and_value(
+                {k: v.unsqueeze(0) for k, v in obs.items()}
+            )
+        ppo_update(policy, optim_, buffer, last_value.item(), device)
+
+    print("[main] Training complete.")
+    torch.save(policy.state_dict(), "policy.pt")
+    print("[main] Model saved to policy.pt")
+
+
+# ---------------------------------------------------------------------------
+# Stable-Baselines3 alternative (uncomment to use)
+# ---------------------------------------------------------------------------
+# from stable_baselines3 import PPO
+# from stable_baselines3.common.env_util import make_vec_env
+# from models.gnn_policy import DualGraphExtractor
+#
+# def train_sb3():
+#     env = make_vec_env(UAVTaskEnv, n_envs=4)
+#     policy_kwargs = dict(
+#         features_extractor_class=DualGraphExtractor,
+#         features_extractor_kwargs=dict(features_dim=128),
+#     )
+#     model = PPO("MultiInputPolicy", env, policy_kwargs=policy_kwargs,
+#                 learning_rate=LR, n_steps=ROLLOUT_STEPS, batch_size=BATCH_SIZE,
+#                 verbose=1)
+#     model.learn(total_timesteps=TOTAL_TIMESTEPS)
+#     model.save("sb3_policy")
+
+
+if __name__ == "__main__":
+    train()
+</file>
+
+<file path="models/__init__.py">
+
+</file>
+
+<file path="models/gnn_policy.py">
+# models/gnn_policy.py
+"""
+GNN-based feature extractor for the dual-graph state.
+
+Architecture
+------------
+Two separate GNN encoders (shared weights optional):
+  - TaskGraphEncoder  : embeds each task node  → pooled task-graph vector
+  - ResourceGraphEncoder: embeds each UAV node → pooled resource-graph vector
+
+The concatenated embedding is passed to an Actor-Critic head.
+
+Usage with Stable-Baselines3
+-----------------------------
+Subclass `BaseFeaturesExtractor` and register via policy_kwargs:
+
+    policy_kwargs = dict(
+        features_extractor_class=DualGraphExtractor,
+        features_extractor_kwargs=dict(features_dim=128),
+    )
+
+For the standalone / custom PPO path the same `DualGraphExtractor` can
+be used as a plain `nn.Module`.
+"""
+
+from __future__ import annotations
+
+from typing import Dict
+
+import torch
+import torch.nn as nn
+
+try:
+    from torch_geometric.nn import SAGEConv, global_mean_pool
+    from torch_geometric.data import Data, Batch
+    _HAS_PYG = True
+except ImportError:
+    _HAS_PYG = False
+
+from configs.params import GNN_HIDDEN_DIM, GNN_NUM_LAYERS, EMBED_DIM
+
+
+# ---------------------------------------------------------------------------
+# Low-level GNN encoder (works with or without PyG)
+# ---------------------------------------------------------------------------
+
+class _GNNEncoder(nn.Module):
+    """
+    Stack of GraphSAGE layers → global mean pool → linear projection.
+
+    Falls back to a simple MLP mean-pool when PyG is not installed,
+    so the project can be imported for unit-testing without heavy deps.
+    """
+
+    def __init__(self, in_channels: int, hidden: int, out_dim: int, num_layers: int):
+        super().__init__()
+        self._use_pyg = _HAS_PYG
+
+        if self._use_pyg:
+            self.convs = nn.ModuleList()
+            self.convs.append(SAGEConv(in_channels, hidden))
+            for _ in range(num_layers - 1):
+                self.convs.append(SAGEConv(hidden, hidden))
+            self.norms = nn.ModuleList(
+                [nn.LayerNorm(hidden) for _ in range(num_layers)]
+            )
+        else:
+            # MLP fallback: treat node features as a set (no edges)
+            layers = [nn.Linear(in_channels, hidden), nn.ReLU()]
+            for _ in range(num_layers - 1):
+                layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+            self.mlp = nn.Sequential(*layers)
+
+        self.proj = nn.Linear(hidden, out_dim)
+        self.act  = nn.ReLU()
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x          : (B, N, F) or (N, F)   node features — padded to fixed N
+        edge_index : (B, 2, E) or (2, E)   COO edge index — padded to fixed E
+        batch      : (B, N)   or (N,)       unused in padded mode (kept for API compat)
+
+        Returns
+        -------
+        (B, out_dim) or (out_dim,)  graph-level embedding per batch element
+        """
+        # Normalise to batched 3-D: (B, N, F) / (B, 2, E)
+        squeeze = (x.dim() == 2)
+        if squeeze:
+            x          = x.unsqueeze(0)           # (1, N, F)
+            edge_index = edge_index.unsqueeze(0)   # (1, 2, E)
+
+        B, N, _ = x.shape
+
+        if self._use_pyg:
+            # Flatten all B graphs into one big graph for a single PyG forward pass.
+            # Shift edge indices of graph b by b*N so they reference the correct nodes.
+            x_flat     = x.reshape(B * N, -1)                              # (B*N, F)
+            offsets    = torch.arange(B, device=x.device).view(B, 1, 1) * N  # (B,1,1)
+            ei_flat    = (edge_index + offsets).permute(1, 0, 2).reshape(2, -1)  # (2, B*E)
+            batch_flat = torch.arange(B, device=x.device).repeat_interleave(N)   # (B*N,)
+
+            for conv, norm in zip(self.convs, self.norms):
+                x_flat = self.act(norm(conv(x_flat, ei_flat)))
+            x_out = global_mean_pool(x_flat, batch_flat)                   # (B, hidden)
+        else:
+            # MLP path: apply to last dim, then mean-pool over node axis.
+            # Zero-padded nodes have all-zero features → contribute ~0 to the mean,
+            # which is an acceptable approximation for a research scaffold.
+            x_out = self.mlp(x).mean(dim=1)                                # (B, hidden)
+
+        out = self.proj(x_out)                                             # (B, out_dim)
+        return out.squeeze(0) if squeeze else out
+
+
+# ---------------------------------------------------------------------------
+# Dual-graph feature extractor
+# ---------------------------------------------------------------------------
+
+class DualGraphExtractor(nn.Module):
+    """
+    Encodes (task_graph, resource_graph, feedback_vector) into a single
+    flat feature vector suitable for an Actor-Critic head.
+
+    Input dict keys expected from the environment observation:
+        "task_x"        : (N_t, task_node_feat_dim)
+        "task_edge"     : (2, E_t)
+        "task_batch"    : (N_t,)
+        "res_x"         : (N_r, res_node_feat_dim)
+        "res_edge"      : (2, E_r)
+        "res_batch"     : (N_r,)
+        "feedback"      : (4,)   [latency_ratio, success_rate, reschedule_count, avg_uav_utilization]
+    """
+
+    TASK_NODE_FEAT_DIM = 2   # [cpu_demand, data_size]
+    RES_NODE_FEAT_DIM  = 3   # [cpu_cap, bandwidth, battery]
+    FEEDBACK_DIM       = 5   # [latency_ratio, success_rate, reschedule_count, avg_uav_utilization, min_link_bw_ratio]
+
+    def __init__(self, features_dim: int = 128):
+        super().__init__()
+        self.task_enc = _GNNEncoder(
+            in_channels=self.TASK_NODE_FEAT_DIM,
+            hidden=GNN_HIDDEN_DIM,
+            out_dim=EMBED_DIM,
+            num_layers=GNN_NUM_LAYERS,
+        )
+        self.res_enc = _GNNEncoder(
+            in_channels=self.RES_NODE_FEAT_DIM,
+            hidden=GNN_HIDDEN_DIM,
+            out_dim=EMBED_DIM,
+            num_layers=GNN_NUM_LAYERS,
+        )
+        fused_dim = EMBED_DIM + EMBED_DIM + self.FEEDBACK_DIM
+        self.fusion = nn.Sequential(
+            nn.Linear(fused_dim, features_dim),
+            nn.ReLU(),
+            nn.Linear(features_dim, features_dim),
+            nn.ReLU(),
+        )
+        self.features_dim = features_dim
+
+    def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        task_emb = self.task_enc(
+            obs["task_x"], obs["task_edge"], obs["task_batch"]
+        )
+        res_emb = self.res_enc(
+            obs["res_x"], obs["res_edge"], obs["res_batch"]
+        )
+        feedback = obs["feedback"]                  # (B, 3)
+        if feedback.dim() == 1:
+            feedback = feedback.unsqueeze(0)
+
+        fused = torch.cat([task_emb, res_emb, feedback], dim=-1)
+        return self.fusion(fused)
+
+
+# ---------------------------------------------------------------------------
+# Minimal Actor-Critic head (placeholder — swap in SB3 PPO for full training)
+# ---------------------------------------------------------------------------
+
+class ActorCriticPolicy(nn.Module):
+    """
+    Thin Actor-Critic wrapper around DualGraphExtractor.
+
+    action_dim should equal AdaptiveTaskShaper.NUM_ACTIONS (3).
+    """
+
+    def __init__(self, action_dim: int = 3, features_dim: int = 128):
+        super().__init__()
+        self.extractor = DualGraphExtractor(features_dim=features_dim)
+
+        self.actor  = nn.Linear(features_dim, action_dim)
+        self.critic = nn.Linear(features_dim, 1)
+
+    def forward(self, obs: Dict[str, torch.Tensor]):
+        feat   = self.extractor(obs)
+        logits = self.actor(feat)
+        value  = self.critic(feat)
+        return logits, value
+
+    def get_action_and_value(self, obs: Dict[str, torch.Tensor]):
+        logits, value = self.forward(obs)
+        dist   = torch.distributions.Categorical(logits=logits)
+        action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), value
+</file>
+
+<file path="README.md">
+# grap-matcher-dqn
+Resource-Aware Task Graph Generation with DQN
+
+record doc/prompt.md to generate a initial version of the project
+</file>
+
+</files>
