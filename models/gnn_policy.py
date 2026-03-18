@@ -141,7 +141,7 @@ class DualGraphExtractor(nn.Module):
 
     TASK_NODE_FEAT_DIM = 2   # [cpu_demand, data_size]
     RES_NODE_FEAT_DIM  = 3   # [cpu_cap, bandwidth, battery]
-    FEEDBACK_DIM       = 5   # [latency_ratio, success_rate, reschedule_count, avg_uav_utilization, min_link_bw_ratio]
+    FEEDBACK_DIM       = 6   # [latency_ratio, success_rate, reschedule_count, avg_uav_utilization, min_link_bw_ratio, min_battery_ratio]
 
     def __init__(self, features_dim: int = 128):
         super().__init__()
@@ -306,14 +306,21 @@ class CrossGraphAttention(nn.Module):
         self,
         task_emb: torch.Tensor,   # (B, N_t, task_dim)
         res_emb:  torch.Tensor,   # (B, N_r, res_dim)
-    ) -> torch.Tensor:
-        """Returns (B, N_t, task_dim) — resource-enriched task embeddings."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns
+        -------
+        out         : (B, N_t, task_dim) — resource-enriched task embeddings
+        attn_weights: (B, N_t, N_r)     — soft task-to-UAV assignment weights
+                      Used downstream to compute per-pair link-quality signals
+                      for the merge scoring head.
+        """
         Q    = self.q_proj(task_emb)                              # (B, N_t, d)
         K    = self.k_proj(res_emb)                               # (B, N_r, d)
         V    = self.v_proj(res_emb)                               # (B, N_r, d)
         attn = torch.softmax(Q @ K.transpose(-1, -2) / self.scale, dim=-1)  # (B, N_t, N_r)
         ctx  = attn @ V                                           # (B, N_t, d)
-        return self.out_proj(ctx)                                 # (B, N_t, task_dim)
+        return self.out_proj(ctx), attn                           # also expose attn weights
 
 
 # ---------------------------------------------------------------------------
@@ -354,26 +361,32 @@ class NodeLevelActorCritic(nn.Module):
         super().__init__()
         N  = MAX_TASK_NODES
         d  = EMBED_DIM                         # 32
-        fb = 5                                  # feedback vector dim
+        fb = 6                                  # feedback vector dim (incl. min_battery)
 
         # Node-level GNN encoders
         self.task_gnn = _GNNNodeEncoder(2, GNN_HIDDEN_DIM, d, GNN_NUM_LAYERS)
         self.res_gnn  = _GNNNodeEncoder(3, GNN_HIDDEN_DIM, d, GNN_NUM_LAYERS)
 
-        # Cross-graph attention: task ← resource
+        # Cross-graph attention: task <- resource (also returns attn weights)
         self.cross_attn = CrossGraphAttention(d, d, d)
 
-        # Global state for noop logit and value
-        global_dim = d + d + fb                # 32 + 32 + 5 = 69
+        # FIX 1: Global state uses GNN mean + raw resource bottleneck (min+mean of res_x)
+        # This preserves "which UAV is the weakest link" information lost by plain mean.
+        # res_raw_dim = min(3) + mean(3) across Nr UAVs = 6
+        res_raw_dim = 6
+        global_dim  = d + d + res_raw_dim + fb  # 32 + 32 + 6 + 6 = 76
         self.noop_head  = nn.Linear(global_dim, 1)
         self.value_head = nn.Linear(global_dim, 1)
 
         # Per-node split head
         self.split_head = nn.Linear(d, 1)
 
-        # Per-pair merge head:  cat(emb_i, emb_j) → scalar
+        # FIX 2: Per-pair merge head adds link-quality signal:
+        #   cat(emb_i, emb_j, link_quality) where link_quality = dot(attn_i, attn_j)
+        #   High dot product -> both tasks attend to same UAV -> no cross-link needed
+        #   Low dot product  -> tasks on different UAVs -> merge eliminates cross-link
         self.merge_head = nn.Sequential(
-            nn.Linear(2 * d, d),
+            nn.Linear(2 * d + 1, d),           # +1 for link_quality scalar
             nn.ReLU(),
             nn.Linear(d, 1),
         )
@@ -390,19 +403,30 @@ class NodeLevelActorCritic(nn.Module):
         res_node  = self.res_gnn(obs["res_x"],    obs["res_edge"])    # (B, Nr, d)
 
         # Cross-graph attention: enrich each task node with UAV context
-        cross_ctx     = self.cross_attn(task_node, res_node)         # (B, N, d)
-        task_enriched = task_node + cross_ctx                         # residual
+        # Also capture attn_weights (B, N, Nr) for merge link-quality scoring
+        cross_ctx, attn_weights = self.cross_attn(task_node, res_node)
+        task_enriched = task_node + cross_ctx                         # residual (B, N, d)
 
-        # Global pooled state
+        # FIX 1: Replace plain res_node mean with explicit resource bottleneck.
+        # min captures the weakest/most-depleted UAV; mean captures general fleet state.
+        # This prevents the noop/value heads from being blind to individual UAV failures.
+        res_x_raw = obs["res_x"]                                      # (B, Nr, 3)
+        if res_x_raw.dim() == 2:
+            res_x_raw = res_x_raw.unsqueeze(0)
+        res_bottleneck = torch.cat([
+            res_x_raw.min(dim=1).values,   # (B, 3) — weakest UAV per feature
+            res_x_raw.mean(dim=1),         # (B, 3) — fleet average per feature
+        ], dim=-1)                                                     # (B, 6)
+
         feedback = obs["feedback"]
         if feedback.dim() == 1:
             feedback = feedback.unsqueeze(0)
         global_state = torch.cat(
-            [task_enriched.mean(dim=1), res_node.mean(dim=1), feedback],
+            [task_enriched.mean(dim=1), res_node.mean(dim=1), res_bottleneck, feedback],
             dim=-1,
-        )                                                              # (B, 69)
+        )                                                              # (B, 76)
 
-        return task_enriched, global_state
+        return task_enriched, global_state, attn_weights
 
     # ------------------------------------------------------------------
     def forward(
@@ -414,7 +438,7 @@ class NodeLevelActorCritic(nn.Module):
         all_logits : (B, ACTION_DIM)  — raw (unmasked) action logits
         value      : (B, 1)
         """
-        task_enriched, global_state = self._encode(obs)
+        task_enriched, global_state, attn_weights = self._encode(obs)
 
         # NOOP logit — single scalar per batch item
         noop_logit   = self.noop_head(global_state)                   # (B, 1)
@@ -425,8 +449,19 @@ class NodeLevelActorCritic(nn.Module):
         # MERGE logits — one per (i,j) pair
         emb_i = task_enriched[:, self.pair_i, :]                     # (B, C, d)
         emb_j = task_enriched[:, self.pair_j, :]                     # (B, C, d)
+
+        # FIX 2: Link-quality signal for each merge candidate pair.
+        # attn_weights[b, n, r] = how strongly task n attends to UAV r.
+        # dot(attn_i, attn_j) is HIGH when both tasks attend to the SAME UAV
+        #   → no cross-UAV transfer needed → merge less urgent
+        # dot(attn_i, attn_j) is LOW when tasks attend to DIFFERENT UAVs
+        #   → cross-link exists → merging eliminates that transfer → more urgent
+        attn_i = attn_weights[:, self.pair_i, :]                     # (B, C, Nr)
+        attn_j = attn_weights[:, self.pair_j, :]                     # (B, C, Nr)
+        link_quality = (attn_i * attn_j).sum(dim=-1, keepdim=True)  # (B, C, 1)
+
         merge_logits = self.merge_head(
-            torch.cat([emb_i, emb_j], dim=-1)
+            torch.cat([emb_i, emb_j, link_quality], dim=-1)
         ).squeeze(-1)                                                  # (B, C)
 
         all_logits = torch.cat(
@@ -468,8 +503,14 @@ class NodeLevelActorCritic(nn.Module):
         # --- NOOP: always valid ---
         noop_mask  = torch.ones(B, 1, dtype=torch.bool, device=device)
 
-        # --- SPLIT: real node AND room to grow ---
-        can_split  = (n_real < N).unsqueeze(1)                        # (B, 1)
+        # --- SPLIT: real node AND room to grow AND fleet has compute capacity ---
+        # FIX 3: Reject split if all UAVs are depleted (eff_cpu_ratio == 0).
+        # res_x[:, :, 0] = eff_cpu_ratio; max > 0 means at least one active UAV.
+        res_x      = obs["res_x"]
+        if res_x.dim() == 2:
+            res_x = res_x.unsqueeze(0)
+        fleet_has_cpu = (res_x[:, :, 0].max(dim=1).values > 0.0).unsqueeze(1)  # (B, 1)
+        can_split  = (n_real < N).unsqueeze(1) & fleet_has_cpu       # (B, 1)
         split_mask = is_real & can_split                              # (B, N)
 
         # --- MERGE: both endpoints are real leaves ---

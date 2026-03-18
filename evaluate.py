@@ -145,23 +145,39 @@ def ppo_update(policy, optimizer, buffer, last_value, device, use_mask=True):
 # RL training loop (generic — works for both rl_global and rl_node)
 # ---------------------------------------------------------------------------
 
-def train_rl(policy, env_seed: int, device: torch.device, method_tag: str):
+def train_rl(policy, env_seed: int, device: torch.device, method_tag: str,
+             log_path: Path | None = None,
+             total_timesteps: int | None = None):
+    """
+    Train policy for total_timesteps steps (default: TOTAL_TIMESTEPS from params).
+    Saves a training log (timestep, mean_reward, mean_latency, mean_success)
+    every LOG_INTERVAL episodes to log_path (JSON), enabling reward-curve plots.
+    """
+    LOG_INTERVAL = 20   # record one data point every N completed episodes
+    n_steps = total_timesteps if total_timesteps is not None else TOTAL_TIMESTEPS
+
     optimizer = optim.Adam(policy.parameters(), lr=LR)
     buffer    = RolloutBuffer()
     env       = UAVTaskEnv(seed=env_seed)
 
-    ep_rewards: deque = deque(maxlen=20)
-    ep_reward = 0.0
-    timestep  = 0
-    episode   = 0
+    ep_rewards:    deque = deque(maxlen=50)
+    ep_latencies:  deque = deque(maxlen=50)
+    ep_successes:  deque = deque(maxlen=50)
+    ep_reward  = 0.0
+    last_info  = {}
+    timestep   = 0
+    episode    = 0
+
+    # Training log: list of dicts {step, reward, latency, success}
+    train_log: List[Dict] = []
 
     obs_np, _ = env.reset()
     obs = obs_to_torch(obs_np, device)
     t0 = time.time()
 
-    print(f"[{method_tag}] Training on seed={env_seed} for {TOTAL_TIMESTEPS} steps …")
+    print(f"[{method_tag}] Training on seed={env_seed} for {n_steps} steps ...")
 
-    while timestep < TOTAL_TIMESTEPS:
+    while timestep < n_steps:
         buffer.clear()
         for _ in range(ROLLOUT_STEPS):
             with torch.no_grad():
@@ -173,16 +189,31 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str):
 
             buffer.add(obs, action.item(), log_prob.item(), reward, value.item(), done)
             ep_reward += reward
+            last_info  = info
             timestep  += 1
 
             if done:
                 ep_rewards.append(ep_reward)
+                ep_latencies.append(last_info.get("latency_ms", 0.0))
+                ep_successes.append(last_info.get("success_rate", 0.0))
                 episode += 1
+
+                # Save log point every LOG_INTERVAL episodes
+                if episode % LOG_INTERVAL == 0:
+                    train_log.append({
+                        "step":    timestep,
+                        "reward":  float(np.mean(ep_rewards)),
+                        "latency": float(np.mean(ep_latencies)),
+                        "success": float(np.mean(ep_successes)),
+                    })
+
                 if episode % 50 == 0:
                     elapsed = time.time() - t0
                     print(
                         f"  [ep {episode:5d} | step {timestep:7d}]"
-                        f"  mean_r={np.mean(ep_rewards):7.2f}"
+                        f"  reward={np.mean(ep_rewards):6.2f}"
+                        f"  latency={np.mean(ep_latencies):6.1f}ms"
+                        f"  success={np.mean(ep_successes):.3f}"
                         f"  fps={timestep/elapsed:.0f}"
                     )
                 ep_reward = 0.0
@@ -198,6 +229,13 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str):
         ppo_update(policy, optimizer, buffer, last_val.item(), device)
 
     print(f"[{method_tag}] Training complete.")
+
+    # Persist training log
+    if log_path is not None:
+        with open(log_path, "w") as f:
+            json.dump(train_log, f)
+        print(f"[{method_tag}] Training log -> {log_path}")
+
     return policy
 
 
@@ -278,6 +316,7 @@ def make_hs_policy():
             reschedule_count    = int(fb_vec[2]),
             avg_uav_utilization = float(fb_vec[3]),
             min_link_bw_ratio   = float(fb_vec[4]),
+            min_battery_ratio   = float(fb_vec[5]),
         )
         op = shaper.suggest_action(fb)
         # op=0 -> noop(0); op=1 -> split node 0 (action 1); op=2 -> merge pair (0,1) (action N+1)
@@ -339,7 +378,8 @@ def make_rl_policy(policy_module: nn.Module, device: torch.device):
 METHOD_CHOICES = ["ns", "hs", "rnd", "rl_global", "rl_node"]
 
 
-def run_one(method: str, seed: int, train: bool, device: torch.device, n_eval: int):
+def run_one(method: str, seed: int, train: bool, device: torch.device,
+            n_eval: int, total_timesteps: int | None = None):
     out_path = RESULTS_DIR / f"{method}_seed{seed}.json"
     if out_path.exists():
         print(f"[skip] {out_path} already exists — delete to re-run.")
@@ -361,9 +401,11 @@ def run_one(method: str, seed: int, train: bool, device: torch.device, n_eval: i
 
     elif method == "rl_global":
         model_path = RESULTS_DIR / f"rl_global_seed{seed}.pt"
+        log_path   = RESULTS_DIR / f"rl_global_seed{seed}_trainlog.json"
         policy = ActorCriticPolicy(action_dim=ACTION_DIM, features_dim=128).to(device)
         if train:
-            policy = train_rl(policy, seed, device, "rl_global")
+            policy = train_rl(policy, seed, device, "rl_global",
+                              log_path=log_path, total_timesteps=total_timesteps)
             torch.save(policy.state_dict(), model_path)
         elif model_path.exists():
             policy.load_state_dict(torch.load(model_path, map_location=device))
@@ -375,9 +417,11 @@ def run_one(method: str, seed: int, train: bool, device: torch.device, n_eval: i
 
     elif method == "rl_node":
         model_path = RESULTS_DIR / f"rl_node_seed{seed}.pt"
+        log_path   = RESULTS_DIR / f"rl_node_seed{seed}_trainlog.json"
         policy = NodeLevelActorCritic().to(device)
         if train:
-            policy = train_rl(policy, seed, device, "rl_node")
+            policy = train_rl(policy, seed, device, "rl_node",
+                              log_path=log_path, total_timesteps=total_timesteps)
             torch.save(policy.state_dict(), model_path)
         elif model_path.exists():
             policy.load_state_dict(torch.load(model_path, map_location=device))
@@ -419,6 +463,8 @@ def main():
                         help="Number of evaluation episodes per method/seed")
     parser.add_argument("--device", default="auto",
                         help="cuda / cpu / auto")
+    parser.add_argument("--timesteps", type=int, default=None,
+                        help="Override TOTAL_TIMESTEPS for RL training (e.g. 50000 for quick test)")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -434,7 +480,8 @@ def main():
 
     for seed in args.seeds:
         for method in methods:
-            run_one(method, seed, args.train, device, args.n_eval)
+            run_one(method, seed, args.train, device, args.n_eval,
+                    total_timesteps=args.timesteps)
 
     print("\n[main] All done. Run `python plot_results.py` to generate figures.")
 

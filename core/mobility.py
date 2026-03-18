@@ -206,6 +206,11 @@ class UAVMobilityModel:
         return features
 
     # ------------------------------------------------------------------
+    def min_battery_ratio(self) -> float:
+        """Return the minimum battery ratio across all UAVs (captures the most depleted node)."""
+        return float(self.battery.min())
+
+    # ------------------------------------------------------------------
     def min_active_link_bw(self) -> float:
         """
         Return the minimum bandwidth among all active-UAV pairs.

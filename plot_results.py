@@ -21,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")   # headless — safe on all platforms
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.ticker
 
 RESULTS_DIR = Path("results")
 FIGURES_DIR = Path("figures")
@@ -280,6 +281,155 @@ def fig7_summary_table(seeds: list[int]):
 
 
 # ---------------------------------------------------------------------------
+# Fig 8 — Learning curves (reward / latency / success vs training steps)
+# ---------------------------------------------------------------------------
+
+def _ema(values: np.ndarray, alpha: float = 0.1) -> np.ndarray:
+    """Exponential moving average smoothing."""
+    out = np.empty_like(values, dtype=float)
+    out[0] = values[0]
+    for i in range(1, len(values)):
+        out[i] = alpha * values[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def _load_trainlog(method: str, seeds: list[int]) -> list[list[dict]]:
+    """Load training logs for all seeds of a method. Returns list of log lists."""
+    logs = []
+    for s in seeds:
+        p = RESULTS_DIR / f"{method}_seed{s}_trainlog.json"
+        if p.exists():
+            with open(p) as f:
+                logs.append(json.load(f))
+    return logs
+
+
+def _baseline_level(metric: str, seeds: list[int]) -> dict[str, tuple[float, float]]:
+    """
+    Read static baseline results and return per-method (mean, std) for `metric`.
+    std is across seeds (inter-seed variance of per-seed mean).
+    metric: 'reward' | 'latency_ms' | 'success_rate'
+    """
+    levels = {}
+    for m in ["ns", "hs", "rnd"]:
+        res = load_results(m, seeds)
+        if not res:
+            continue
+        vals = [np.mean(r["episodes"][metric]) for r in res.values()]
+        levels[m] = (float(np.mean(vals)), float(np.std(vals)))
+    return levels
+
+
+def _interp_to_common_grid(logs: list[list[dict]], metric: str,
+                            n_points: int = 200) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Interpolate all seed logs onto a common step grid.
+    Returns (x_grid, mean_curve, std_curve).
+    """
+    all_x = [np.array([e["step"] for e in log]) for log in logs]
+    all_y = [np.array([e[metric] for e in log]) for log in logs]
+
+    x_min = max(arr[0] for arr in all_x)
+    x_max = min(arr[-1] for arr in all_x)
+    if x_min >= x_max:
+        x_max = max(arr[-1] for arr in all_x)
+        x_min = 0
+
+    grid = np.linspace(x_min, x_max, n_points)
+    interp_curves = []
+    for x, y in zip(all_x, all_y):
+        interp_curves.append(np.interp(grid, x, y))
+
+    mat = np.stack(interp_curves, axis=0)   # (n_seeds, n_points)
+    return grid, mat.mean(axis=0), mat.std(axis=0)
+
+
+def fig8_learning_curves(seeds: list[int], metric: str = "reward"):
+    """
+    Plot training learning curves for rl_global and rl_node.
+
+    Parameters
+    ----------
+    metric : 'reward' | 'latency_ms' | 'success_rate'
+    """
+    # Map public metric names to trainlog JSON keys
+    LOG_KEY = {
+        "reward":      "reward",
+        "latency_ms":  "latency",
+        "success_rate":"success",
+    }
+    log_key = LOG_KEY.get(metric, metric)
+
+    train_methods = ["rl_global", "rl_node"]
+    found_any = False
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for method in train_methods:
+        logs = _load_trainlog(method, seeds)
+        if not logs:
+            continue
+        found_any = True
+
+        grid, mean_curve, std_curve = _interp_to_common_grid(logs, log_key)
+        smooth_mean = _ema(mean_curve, alpha=0.15)
+        smooth_std  = _ema(std_curve,  alpha=0.15)
+
+        s = STYLE[method]
+        ax.plot(grid, smooth_mean, label=s["label"],
+                color=s["color"], linewidth=2, linestyle=s["ls"])
+        ax.fill_between(grid,
+                        smooth_mean - smooth_std,
+                        smooth_mean + smooth_std,
+                        color=s["color"], alpha=0.15)
+
+    if not found_any:
+        print(f"[fig8] No training logs found for metric='{metric}'. "
+              "Run evaluate.py --method rl_global / rl_node first.")
+        plt.close()
+        return
+
+    # Horizontal reference bands for static baselines (mean ± std across seeds)
+    # These baselines have no learning — their reward is a stationary distribution,
+    # so we show them as flat bands rather than training curves.
+    baseline_levels = _baseline_level(metric, seeds)
+    ref_style = {
+        "ns":  ("No Shaping (NS)",  "#888888", (4, 2)),
+        "hs":  ("Heuristic (HS)",   "#F5A623", (4, 2)),
+        "rnd": ("Random (RND)",     "#D0021B", (2, 2)),
+    }
+    x_lo, x_hi = ax.get_xlim()
+    # fallback if axes not yet scaled
+    if x_lo == 0 and x_hi == 1:
+        x_lo, x_hi = 0, 1_000_000
+    for m, (mu, sd) in baseline_levels.items():
+        label, color, dashes = ref_style[m]
+        ax.axhline(mu, color=color, linewidth=1.5,
+                   linestyle=(0, dashes), label=f"{label} mean")
+        ax.axhspan(mu - sd, mu + sd, color=color, alpha=0.08)
+
+    ylabel = METRICS_LABEL.get(metric, metric)
+    ax.set_xlabel("Training Steps", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(f"Learning Curves — {ylabel}", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=8, loc="best", ncol=2)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.grid(True, alpha=0.35, linestyle="--")
+    ax.set_axisbelow(True)
+    ax.xaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda x, _: f"{x/1e3:.0f}k")
+    )
+
+    plt.tight_layout()
+    out = FIGURES_DIR / f"fig8_learning_curves_{metric}.pdf"
+    plt.savefig(out, bbox_inches="tight")
+    plt.savefig(str(out).replace(".pdf", ".png"), bbox_inches="tight", dpi=150)
+    print(f"[fig8] Saved -> {out}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
 # Fig 3 — Reward distribution box plot (per-seed robustness)
 # ---------------------------------------------------------------------------
 
@@ -339,13 +489,16 @@ def fig3_reward_boxplot(seeds: list[int]):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fig",   type=int, nargs="+",
-                        choices=[3, 4, 5, 6, 7],
+                        choices=[3, 4, 5, 6, 7, 8],
                         help="Figure numbers to generate (default: all)")
     parser.add_argument("--seeds", type=int, nargs="+", default=list(range(5)),
                         help="Seeds to aggregate (default: 0 1 2 3 4)")
+    parser.add_argument("--metric", default="reward",
+                        choices=["reward", "latency_ms", "success_rate"],
+                        help="Metric for fig8 learning curves (default: reward)")
     args = parser.parse_args()
 
-    figs = args.fig or [3, 4, 5, 6, 7]
+    figs = args.fig or [3, 4, 5, 6, 7, 8]
     seeds = args.seeds
 
     dispatch = {
@@ -354,6 +507,7 @@ def main():
         5: fig5_nodes_bar,
         6: fig6_latency_cdf,
         7: fig7_summary_table,
+        8: lambda s: fig8_learning_curves(s, metric=args.metric),
     }
 
     for f in figs:

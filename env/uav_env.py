@@ -208,8 +208,8 @@ class UAVTaskEnv(gym.Env):
             "res_x":     spaces.Box(0.0, 1.0,  shape=(Nr, 3),     dtype=np.float32),
             "res_edge":  spaces.Box(0,   Nr,   shape=(2, Nr * Nr), dtype=np.int64),
             "res_batch": spaces.Box(0,   0,    shape=(Nr,),        dtype=np.int64),
-            # feedback: 5 signals including min_link_bw_ratio (mobility-aware)
-            "feedback":  spaces.Box(-np.inf, np.inf, shape=(5,),  dtype=np.float32),
+            # feedback: 6 signals including min_link_bw_ratio and min_battery_ratio
+            "feedback":  spaces.Box(-np.inf, np.inf, shape=(6,),  dtype=np.float32),
         })
         # Node-level action space: 1 noop + N split + C(N,2) merge = 56 actions
         self.action_space = spaces.Discrete(ACTION_DIM)
@@ -271,15 +271,17 @@ class UAVTaskEnv(gym.Env):
         # 5. Advance UAV positions for next step
         self._mobility.step()
 
-        # 6. Update feedback — now includes topology (link BW) signal
+        # 6. Update feedback — includes topology (link BW) and energy (battery) signals
         latency_ratio    = latency / DEADLINE_MS
         min_bw_ratio     = self._mobility.min_active_link_bw() / BW_MAX_MBPS
+        min_battery      = self._mobility.min_battery_ratio()
         self._feedback = SchedulingFeedback(
             latency_ratio=latency_ratio,
             success_rate=success_rate,
             reschedule_count=reschedule_count,
             avg_uav_utilization=avg_util,
             min_link_bw_ratio=min_bw_ratio,
+            min_battery_ratio=min_battery,
         )
 
         # 7. Reward
@@ -300,13 +302,24 @@ class UAVTaskEnv(gym.Env):
         return self._get_obs(), reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
-    def _compute_reward(
-        self, latency: float, success_rate: float, reschedule_count: int
-    ) -> float:
-        r = success_rate * len(self._task_graph)        # +1 per matched task
-        r -= 0.5 * reschedule_count
-        if latency > DEADLINE_MS:
-            r -= 1.0
+    def _compute_reward(self, latency, success_rate, reschedule_count):
+        latency_ratio = latency / DEADLINE_MS
+
+        # --- success: primary signal, in [0, 1] ---
+        r = 2.0 * success_rate
+
+        # --- latency: only reward when under deadline, clipped to [0, 1.5] ---
+        # Avoids unbounded negative values and the double-penalty discontinuity.
+        # Being faster than deadline earns up to +1.5; exceeding deadline earns 0 here.
+        r += 1.5 * max(0.0, 1.0 - latency_ratio)
+
+        # --- reschedule: soft penalty ---
+        r -= 0.1 * reschedule_count
+
+        # --- deadline violation: single clean penalty ---
+        if latency_ratio > 1.0:
+            r -= 2.0
+
         return float(r)
 
     # ------------------------------------------------------------------

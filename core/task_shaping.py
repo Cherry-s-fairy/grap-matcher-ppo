@@ -43,8 +43,7 @@ class SchedulingFeedback:
     latency_ratio       : achieved_latency / deadline  (>1.0 means deadline missed)
     success_rate        : fraction of tasks successfully offloaded in [0, 1]
     reschedule_count    : number of tasks that had to be rescheduled
-    avg_uav_utilization : fraction of total UAV CPU capacity consumed in [0, 1]
-                          High value → fleet is heavily loaded → agent should consider merge
+    avg_uav_utilization : fraction of total UAV CPU capacity consumed in [0, 1]， High value → fleet is heavily loaded → agent should consider merge
     """
 
     def __init__(
@@ -54,23 +53,28 @@ class SchedulingFeedback:
         reschedule_count: int = 0,
         avg_uav_utilization: float = 0.0,
         min_link_bw_ratio: float = 1.0,
+        min_battery_ratio: float = 1.0,
     ):
         self.latency_ratio       = float(latency_ratio)
         self.success_rate        = float(success_rate)
         self.reschedule_count    = int(reschedule_count)
         self.avg_uav_utilization = float(avg_uav_utilization)
-        # min_link_bw_ratio: weakest active link / BW_MAX_MBPS ∈ [0, 1]
-        # Low value → topology is fragmented → merge tasks to cut cross-link traffic
+        # min_link_bw_ratio: weakest active link / BW_MAX_MBPS in [0, 1]
+        # Low value -> topology is fragmented -> merge tasks to cut cross-link traffic
         self.min_link_bw_ratio   = float(min_link_bw_ratio)
+        # min_battery_ratio: most depleted UAV battery in [0, 1]
+        # Low value -> fleet is losing nodes -> agent should act urgently
+        self.min_battery_ratio   = float(min_battery_ratio)
 
     def as_vector(self) -> List[float]:
-        """Return a fixed-length (5) feature vector for use as RL state input."""
+        """Return a fixed-length (6) feature vector for use as RL state input."""
         return [
             self.latency_ratio,
             self.success_rate,
             float(self.reschedule_count),
             self.avg_uav_utilization,
             self.min_link_bw_ratio,
+            self.min_battery_ratio,
         ]
 
 

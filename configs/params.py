@@ -22,8 +22,8 @@ TASK_CPU_DEMAND_RANGE = (0.5, 4.0)   # CPU units demanded per task
 TASK_DATA_SIZE_RANGE  = (0.5, 5.0)   # MB per task edge (UAV sensing payloads)
 
 # --- Task Shaping ---
-SHAPING_SPLIT_THRESHOLD   = 0.8   # latency ratio that triggers node splitting
-SHAPING_MERGE_THRESHOLD   = 0.3   # success-rate below which nodes are merged
+SHAPING_SPLIT_THRESHOLD   = 0.5   # latency ratio that triggers node splitting
+SHAPING_MERGE_THRESHOLD   = 0.7   # success-rate below which nodes are merged
 MAX_SHAPING_STEPS         = 3     # max topology edits per episode step
 
 # --- Scheduling / Matching ---
@@ -35,12 +35,12 @@ MAX_EPISODE_STEPS   = 50
 GAMMA               = 0.99
 LR                  = 3e-4
 CLIP_EPS            = 0.2      # PPO clip epsilon
-ENTROPY_COEF        = 0.01
+ENTROPY_COEF        = 0.03
 VALUE_LOSS_COEF     = 0.5
 PPO_EPOCHS          = 4
 BATCH_SIZE          = 64
 ROLLOUT_STEPS       = 256
-TOTAL_TIMESTEPS     = 200_000
+TOTAL_TIMESTEPS     = 1_000_000
 
 # --- UAV Mobility (Random Waypoint Model) ---
 AREA_SIZE_M      = 600.0    # simulation arena (m × m) — keeps most pairs within COMM_RANGE
