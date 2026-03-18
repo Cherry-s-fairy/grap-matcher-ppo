@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Read(//mnt/d/Cherry/Code/PycharmProject/**)",
+      "Bash(pip list:*)",
+      "Bash(cd:*)"
     ]
   }
 }
