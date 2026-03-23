@@ -218,6 +218,8 @@ class UAVTaskEnv(gym.Env):
         self._task_graph: nx.DiGraph = nx.DiGraph()
         self._feedback   = SchedulingFeedback()
         self._step_count = 0
+        self._prev_latency_ratio = 1.0   # neutral: "at deadline", any improvement → positive delta
+        self._prev_success_rate  = 0.0   # neutral: "no success", any success → positive delta
 
     # ------------------------------------------------------------------
     def reset(
@@ -237,6 +239,8 @@ class UAVTaskEnv(gym.Env):
         self._mobility.reset()
         self._feedback   = SchedulingFeedback()
         self._step_count = 0
+        self._prev_latency_ratio = 1.0   # neutral: "at deadline", any improvement → positive delta
+        self._prev_success_rate  = 0.0   # neutral: "no success", any success → positive delta
 
         return self._get_obs(), {}
 
@@ -286,6 +290,8 @@ class UAVTaskEnv(gym.Env):
 
         # 7. Reward
         reward = self._compute_reward(latency, success_rate, reschedule_count)
+        self._prev_latency_ratio = latency_ratio
+        self._prev_success_rate  = success_rate
 
         # 8. Termination
         terminated = latency > DEADLINE_MS * 2          # catastrophic failure
@@ -304,21 +310,25 @@ class UAVTaskEnv(gym.Env):
     # ------------------------------------------------------------------
     def _compute_reward(self, latency, success_rate, reschedule_count):
         latency_ratio = latency / DEADLINE_MS
+        n_nodes = len(self._task_graph)
 
-        # --- success: primary signal, in [0, 1] ---
-        r = 2.0 * success_rate
-
-        # --- latency: only reward when under deadline, clipped to [0, 1.5] ---
-        # Avoids unbounded negative values and the double-penalty discontinuity.
-        # Being faster than deadline earns up to +1.5; exceeding deadline earns 0 here.
+        # --- 绝对质量信号（维持好性能也有奖励）---
+        r  = 2.0 * success_rate
         r += 1.5 * max(0.0, 1.0 - latency_ratio)
 
-        # --- reschedule: soft penalty ---
-        r -= 0.1 * reschedule_count
+        # --- Delta 奖励：鼓励比上一步更好（核心改进）---
+        r += 1.0 * (self._prev_latency_ratio - latency_ratio)  # 延迟降低 → 正奖励
+        r += 0.5 * (success_rate - self._prev_success_rate)    # 成功率提升 → 正奖励
 
-        # --- deadline violation: single clean penalty ---
+        # --- 惩罚：reschedule 惩罚从 0.1 提升到 0.3 ---
+        r -= 0.3 * reschedule_count
+
+        # --- 平滑 deadline 惩罚（去掉 -2.0 硬截断）---
         if latency_ratio > 1.0:
-            r -= 2.0
+            r -= 2.0 * (latency_ratio - 1.0)
+
+        # --- 拓扑膨胀惩罚 ---
+        r -= 0.05 * max(0, n_nodes - 12)
 
         return float(r)
 

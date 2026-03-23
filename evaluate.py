@@ -95,15 +95,27 @@ class RolloutBuffer:
             returns.insert(0, R)
         return torch.tensor(returns, dtype=torch.float32)
 
+    def compute_gae(self, last_value: float, gamma: float, lam: float = 0.95):
+        advantages = []
+        gae = 0.0
+        vals = self.values + [last_value]
+        for t in reversed(range(len(self.rewards))):
+            delta = self.rewards[t] + gamma * vals[t + 1] * (1.0 - float(self.dones[t])) - vals[t]
+            gae   = delta + gamma * lam * (1.0 - float(self.dones[t])) * gae
+            advantages.insert(0, gae)
+        returns = [adv + val for adv, val in zip(advantages, self.values)]
+        return (torch.tensor(advantages, dtype=torch.float32),
+                torch.tensor(returns,    dtype=torch.float32))
+
 
 def ppo_update(policy, optimizer, buffer, last_value, device, use_mask=True):
-    returns    = buffer.compute_returns(last_value, GAMMA).to(device)
-    old_log_ps = torch.tensor(buffer.log_probs, dtype=torch.float32).to(device)
-    actions_t  = torch.tensor(buffer.actions,   dtype=torch.long).to(device)
-    values_t   = torch.tensor(buffer.values,    dtype=torch.float32).to(device)
+    advantages_t, returns_t = buffer.compute_gae(last_value, GAMMA)
+    advantages_t = advantages_t.to(device)
+    returns_t    = returns_t.to(device)
+    old_log_ps   = torch.tensor(buffer.log_probs, dtype=torch.float32).to(device)
+    actions_t    = torch.tensor(buffer.actions,   dtype=torch.long).to(device)
 
-    advantages = (returns - values_t).detach()
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
     for _ in range(PPO_EPOCHS):
         idx = torch.randperm(len(buffer.actions))
@@ -127,12 +139,12 @@ def ppo_update(policy, optimizer, buffer, last_value, device, use_mask=True):
             entropy    = dist.entropy().mean()
 
             ratio  = (new_log_ps - old_log_ps[mb_idx]).exp()
-            adv_mb = advantages[mb_idx]
+            adv_mb = advantages_t[mb_idx]
 
             surr1 = ratio * adv_mb
             surr2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * adv_mb
             actor_loss  = -torch.min(surr1, surr2).mean()
-            critic_loss = nn.functional.mse_loss(new_values.squeeze(-1), returns[mb_idx])
+            critic_loss = nn.functional.mse_loss(new_values.squeeze(-1), returns_t[mb_idx])
             loss = actor_loss + VALUE_LOSS_COEF * critic_loss - ENTROPY_COEF * entropy
 
             optimizer.zero_grad()
@@ -354,7 +366,7 @@ def make_rnd_policy(seed: int = 0):
 
 
 def make_rl_policy(policy_module: nn.Module, device: torch.device):
-    """Wrap a trained RL policy as a callable policy_fn."""
+    """Wrap a trained RL policy as a callable policy_fn (deterministic argmax at eval)."""
     policy_module.eval()
 
     def policy(obs_np):
@@ -365,7 +377,11 @@ def make_rl_policy(policy_module: nn.Module, device: torch.device):
             for k, v in obs_np.items()
         }
         with torch.no_grad():
-            action, _, _, _ = policy_module.get_action_and_value(obs_t)
+            logits, _ = policy_module(obs_t)
+            if hasattr(policy_module, "compute_action_mask"):
+                mask = policy_module.compute_action_mask(obs_t)
+                logits = logits.masked_fill(~mask, float("-inf"))
+            action = logits.argmax(dim=-1)
         return action.item()
 
     return policy

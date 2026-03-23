@@ -191,25 +191,23 @@ class AdaptiveTaskShaper:
         new_id = max(g.nodes) + 1
         child_a, child_b = target, new_id
 
-        # update target in place (becomes child_a)
+        # update target in place (becomes child_a): halve resources
         g.nodes[child_a]["cpu"]       = cpu / 2.0
         g.nodes[child_a]["data_size"] = data_size / 2.0
 
-        # add child_b
+        # add child_b with same halved resources
         g.add_node(
             child_b,
             cpu=cpu / 2.0,
             data_size=data_size / 2.0,
         )
 
-        # child_a → child_b (sequential dependency)
-        g.add_edge(child_a, child_b, transfer_mb=data_size / 2.0)
-
-        # re-attach child_b to all original successors of child_a
+        # Parallel split: child_b inherits ALL predecessors and successors of child_a.
+        # No child_a → child_b edge — they execute concurrently on different UAVs.
+        for pred in list(g.predecessors(child_a)):
+            g.add_edge(pred, child_b, transfer_mb=g[pred][child_a].get("transfer_mb", 1.0))
         for succ in list(g.successors(child_a)):
-            if succ != child_b:
-                g.add_edge(child_b, succ, transfer_mb=g[child_a][succ].get("transfer_mb", 1.0))
-                g.remove_edge(child_a, succ)
+            g.add_edge(child_b, succ, transfer_mb=g[child_a][succ].get("transfer_mb", 1.0))
 
         return g, {"action_taken": "split", "delta_nodes": 1}
 
@@ -274,13 +272,14 @@ class AdaptiveTaskShaper:
         g.nodes[node_id]["cpu"]       = cpu / 2.0
         g.nodes[node_id]["data_size"] = data_size / 2.0
         g.add_node(new_id, cpu=cpu / 2.0, data_size=data_size / 2.0)
-        g.add_edge(node_id, new_id, transfer_mb=data_size / 2.0)
 
+        # Parallel split: new_id inherits ALL predecessors and successors of node_id.
+        # No node_id → new_id edge — the two halves execute concurrently on separate UAVs,
+        # cutting the effective CPU bottleneck in half and exposing parallelism.
+        for pred in list(g.predecessors(node_id)):
+            g.add_edge(pred, new_id, transfer_mb=g[pred][node_id].get("transfer_mb", 1.0))
         for succ in list(g.successors(node_id)):
-            if succ != new_id:
-                g.add_edge(new_id, succ,
-                           transfer_mb=g[node_id][succ].get("transfer_mb", 1.0))
-                g.remove_edge(node_id, succ)
+            g.add_edge(new_id, succ, transfer_mb=g[node_id][succ].get("transfer_mb", 1.0))
 
         return g, {"action_taken": "split", "delta_nodes": 1, "target": node_id}
 
@@ -380,9 +379,13 @@ def generate_random_task_dag(
                     transfer_mb=rng.uniform(*TASK_DATA_SIZE_RANGE),
                 )
 
-    # ensure connectivity: chain 0→1→2→...
-    for i in range(num_nodes - 1):
-        if not g.has_edge(i, i + 1):
-            g.add_edge(i, i + 1, transfer_mb=rng.uniform(*TASK_DATA_SIZE_RANGE))
+    # ensure connectivity: each non-root node gets at least one incoming edge from
+    # a randomly chosen earlier node, creating branching DAGs instead of a forced
+    # sequential chain (which would make every split trivially worse due to longer
+    # critical paths).
+    for i in range(1, num_nodes):
+        if g.in_degree(i) == 0:
+            j = rng.randint(0, i - 1)
+            g.add_edge(j, i, transfer_mb=rng.uniform(*TASK_DATA_SIZE_RANGE))
 
     return g

@@ -2,22 +2,26 @@
 # Simulation and training hyperparameters
 
 # --- UAV Fleet ---
-NUM_UAVS = 6
+# Scaled to 10 UAVs with doubled CPU to match the larger task graph (up to 20 nodes).
+# Resource balance: fleet CPU ≈ 52, mean task demand ≈ 20×2.25=45 → ~90% success target.
+NUM_UAVS = 8
 
 # Each UAV is defined by (cpu_capacity, bandwidth_mbps, battery_pct)
 # Heterogeneous by design: mix of high-compute, high-bandwidth, balanced nodes
 UAV_PROFILES = [
-    {"id": 0, "cpu": 8.0,  "bw": 100.0, "battery": 1.0},   # edge-server class
-    {"id": 1, "cpu": 4.0,  "bw": 50.0,  "battery": 0.9},   # mid-tier
-    {"id": 2, "cpu": 4.0,  "bw": 80.0,  "battery": 0.85},  # high-bandwidth
-    {"id": 3, "cpu": 2.0,  "bw": 30.0,  "battery": 0.95},  # lightweight
-    {"id": 4, "cpu": 2.0,  "bw": 20.0,  "battery": 0.7},   # low-resource
-    {"id": 5, "cpu": 6.0,  "bw": 60.0,  "battery": 0.8},   # balanced
+    {"id": 0, "cpu": 16.0, "bw": 100.0, "battery": 1.0},   # edge-server class
+    {"id": 1, "cpu": 8.0,  "bw": 50.0,  "battery": 0.9},   # mid-tier
+    {"id": 2, "cpu": 8.0,  "bw": 80.0,  "battery": 0.85},  # high-bandwidth
+    {"id": 3, "cpu": 4.0,  "bw": 30.0,  "battery": 0.95},  # lightweight
+    {"id": 4, "cpu": 4.0,  "bw": 20.0,  "battery": 0.7},   # low-resource
+    {"id": 5, "cpu": 12.0, "bw": 60.0,  "battery": 0.8},   # balanced
+    {"id": 6, "cpu": 6.0,  "bw": 90.0,  "battery": 0.75},  # high-bandwidth B
+    {"id": 7, "cpu": 10.0, "bw": 40.0,  "battery": 0.95},  # compute-heavy
 ]
 
 # --- Task Graph ---
-MAX_TASK_NODES = 10          # maximum nodes in the DAG
-MIN_TASK_NODES = 3
+MAX_TASK_NODES = 20          # maximum nodes in the DAG
+MIN_TASK_NODES = 5
 TASK_CPU_DEMAND_RANGE = (0.5, 4.0)   # CPU units demanded per task
 TASK_DATA_SIZE_RANGE  = (0.5, 5.0)   # MB per task edge (UAV sensing payloads)
 
@@ -33,14 +37,14 @@ TRANSFER_LATENCY_BASE = 5.0     # base transfer ms per MB (static fallback)
 # --- RL Training ---
 MAX_EPISODE_STEPS   = 50
 GAMMA               = 0.99
-LR                  = 3e-4
+LR                  = 1e-4   # 3e-4 → 1e-4（大 rollout 配合小 LR 更稳定）
 CLIP_EPS            = 0.2      # PPO clip epsilon
-ENTROPY_COEF        = 0.03
+ENTROPY_COEF        = 0.05   # 0.03 → 0.05（加强 211 动作空间的探索）
 VALUE_LOSS_COEF     = 0.5
 PPO_EPOCHS          = 4
-BATCH_SIZE          = 64
-ROLLOUT_STEPS       = 256
-TOTAL_TIMESTEPS     = 1_000_000
+BATCH_SIZE          = 128    # 64 → 128（更多样的 minibatch）
+ROLLOUT_STEPS       = 2048   # 256 → 2048（每次更新 ~41 个 episode，梯度方差降低）
+TOTAL_TIMESTEPS     = 2_000_000  # increased: larger action space (211) needs more exploration
 
 # --- UAV Mobility (Random Waypoint Model) ---
 AREA_SIZE_M      = 600.0    # simulation arena (m × m) — keeps most pairs within COMM_RANGE
@@ -63,8 +67,8 @@ BATTERY_DEAD_RATIO= 0.0     # UAV is offline when battery reaches this value
 # --- Node-level Action Space ---
 # Layout: 0=noop | 1..MAX_TASK_NODES=split(node_i) | rest=merge(node_i, node_j)
 N_SPLIT_ACTIONS = MAX_TASK_NODES
-N_MERGE_ACTIONS = MAX_TASK_NODES * (MAX_TASK_NODES - 1) // 2   # C(N,2) = 45
-ACTION_DIM      = 1 + N_SPLIT_ACTIONS + N_MERGE_ACTIONS         # = 56
+N_MERGE_ACTIONS = MAX_TASK_NODES * (MAX_TASK_NODES - 1) // 2   # C(20,2) = 190
+ACTION_DIM      = 1 + N_SPLIT_ACTIONS + N_MERGE_ACTIONS         # = 211
 
 # Pre-compute the flat pair list for O(1) action decoding
 _PAIR_LIST: list = [

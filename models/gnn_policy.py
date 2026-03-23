@@ -402,6 +402,10 @@ class NodeLevelActorCritic(nn.Module):
         task_node = self.task_gnn(obs["task_x"],  obs["task_edge"])   # (B, N, d)
         res_node  = self.res_gnn(obs["res_x"],    obs["res_edge"])    # (B, Nr, d)
 
+        # 掩码零填充节点，阻止其污染嵌入
+        task_real = (obs["task_x"].abs().sum(-1, keepdim=True) > 0)  # (B, N, 1)
+        task_node = task_node * task_real                             # 清零 padding 行
+
         # Cross-graph attention: enrich each task node with UAV context
         # Also capture attn_weights (B, N, Nr) for merge link-quality scoring
         cross_ctx, attn_weights = self.cross_attn(task_node, res_node)
@@ -418,11 +422,15 @@ class NodeLevelActorCritic(nn.Module):
             res_x_raw.mean(dim=1),         # (B, 3) — fleet average per feature
         ], dim=-1)                                                     # (B, 6)
 
+        # masked mean（只对真实节点求均值）
+        n_real = task_real.float().sum(dim=1).clamp(min=1.0)         # (B, 1)
+        task_mean = task_enriched.sum(dim=1) / n_real                # (B, d)
+
         feedback = obs["feedback"]
         if feedback.dim() == 1:
             feedback = feedback.unsqueeze(0)
         global_state = torch.cat(
-            [task_enriched.mean(dim=1), res_node.mean(dim=1), res_bottleneck, feedback],
+            [task_mean, res_node.mean(dim=1), res_bottleneck, feedback],
             dim=-1,
         )                                                              # (B, 76)
 
