@@ -107,6 +107,11 @@ class _GNNEncoder(nn.Module):
             ei_flat    = (edge_index + offsets).permute(1, 0, 2).reshape(2, -1)  # (2, B*E)
             batch_flat = torch.arange(B, device=x.device).repeat_interleave(N)   # (B*N,)
 
+            # Filter out padding self-loops (src==dst): real DAGs have no self-loops,
+            # so all (i,i) entries in the padded COO tensor are artificial padding zeros.
+            real_mask = ei_flat[0] != ei_flat[1]
+            ei_flat   = ei_flat[:, real_mask]
+
             for conv, norm in zip(self.convs, self.norms):
                 x_flat = self.act(norm(conv(x_flat, ei_flat)))
             x_out = global_mean_pool(x_flat, batch_flat)                   # (B, hidden)
@@ -267,6 +272,10 @@ class _GNNNodeEncoder(nn.Module):
             x_flat  = x.reshape(B * N, -1)
             offsets = torch.arange(B, device=x.device).view(B, 1, 1) * N
             ei_flat = (edge_index + offsets).permute(1, 0, 2).reshape(2, -1)
+            # Filter out padding self-loops (src==dst): DAGs have no self-loops,
+            # so all (0,0) entries in the padded COO are artificial padding.
+            real_mask = ei_flat[0] != ei_flat[1]
+            ei_flat   = ei_flat[:, real_mask]
             for conv, norm in zip(self.convs, self.norms):
                 x_flat = self.act(norm(conv(x_flat, ei_flat)))
             x_out = x_flat.reshape(B, N, -1)               # (B, N, hidden)

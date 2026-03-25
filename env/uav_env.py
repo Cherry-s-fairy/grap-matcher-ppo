@@ -320,15 +320,18 @@ class UAVTaskEnv(gym.Env):
         r += 1.0 * (self._prev_latency_ratio - latency_ratio)  # 延迟降低 → 正奖励
         r += 0.5 * (success_rate - self._prev_success_rate)    # 成功率提升 → 正奖励
 
-        # --- 惩罚：reschedule 惩罚从 0.1 提升到 0.3 ---
-        r -= 0.3 * reschedule_count
+        # --- 惩罚：reschedule 惩罚按图规模归一化（避免大图被双重惩罚）---
+        # reschedule_rate = 每节点失调比例，消除"图越大 reschedule 绝对数越多"的偏差
+        reschedule_rate = reschedule_count / max(n_nodes, 1)
+        r -= 1.0 * reschedule_rate
 
         # --- 平滑 deadline 惩罚（去掉 -2.0 硬截断）---
         if latency_ratio > 1.0:
             r -= 2.0 * (latency_ratio - 1.0)
 
-        # --- 拓扑膨胀惩罚 ---
-        r -= 0.05 * max(0, n_nodes - 12)
+        # --- 拓扑膨胀惩罚：改用极小系数，仅防止图无限膨胀，不抑制有效 split ---
+        # 阈值升到 MAX_TASK_NODES-2=18，正常 shaping 不触发此惩罚
+        r -= 0.05 * max(0, n_nodes - 18)
 
         return float(r)
 
