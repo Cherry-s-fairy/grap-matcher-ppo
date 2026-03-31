@@ -4,7 +4,9 @@
       "Bash(python:*)",
       "Read(//mnt/d/Cherry/Code/PycharmProject/**)",
       "Bash(pip list:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(''''Keys:'''', list\\(d.keys\\(\\)\\)\\); print\\(''''Length of first key:'''', len\\(d[list\\(d.keys\\(\\)\\)[0]]\\)\\)\")",
+      "Read(//c/Users/27183/**)"
     ]
   }
 }

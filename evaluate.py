@@ -25,6 +25,7 @@ Results saved to: results/<method>_seed<N>.json
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import random
@@ -114,6 +115,7 @@ def ppo_update(policy, optimizer, buffer, last_value, device, use_mask=True):
     returns_t    = returns_t.to(device)
     old_log_ps   = torch.tensor(buffer.log_probs, dtype=torch.float32).to(device)
     actions_t    = torch.tensor(buffer.actions,   dtype=torch.long).to(device)
+    old_values_t = torch.tensor(buffer.values,    dtype=torch.float32).to(device)
 
     advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
@@ -127,6 +129,7 @@ def ppo_update(policy, optimizer, buffer, last_value, device, use_mask=True):
                 mb_obs[key] = torch.stack([o[key] for o in mb_obs_list], dim=0).to(device)
 
             logits, new_values = policy(mb_obs)
+            new_values = new_values.squeeze(-1)
 
             if use_mask and hasattr(policy, "compute_action_mask"):
                 mask          = policy.compute_action_mask(mb_obs)
@@ -144,7 +147,17 @@ def ppo_update(policy, optimizer, buffer, last_value, device, use_mask=True):
             surr1 = ratio * adv_mb
             surr2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * adv_mb
             actor_loss  = -torch.min(surr1, surr2).mean()
-            critic_loss = nn.functional.mse_loss(new_values.squeeze(-1), returns_t[mb_idx])
+
+            # Value function clipping (PPO standard): prevents large critic updates
+            # that destabilise the policy via bad advantage estimates.
+            ret_mb = returns_t[mb_idx]
+            v_unclipped = (new_values - ret_mb).pow(2)
+            v_clipped   = old_values_t[mb_idx] + (new_values - old_values_t[mb_idx]).clamp(
+                -CLIP_EPS, CLIP_EPS
+            )
+            v_loss_clipped = (v_clipped - ret_mb).pow(2)
+            critic_loss = 0.5 * torch.max(v_unclipped, v_loss_clipped).mean()
+
             loss = actor_loss + VALUE_LOSS_COEF * critic_loss - ENTROPY_COEF * entropy
 
             optimizer.zero_grad()
@@ -167,8 +180,15 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str,
     """
     LOG_INTERVAL = 20   # record one data point every N completed episodes
     n_steps = total_timesteps if total_timesteps is not None else TOTAL_TIMESTEPS
+    n_updates = n_steps // ROLLOUT_STEPS   # total number of PPO update calls
 
     optimizer = optim.Adam(policy.parameters(), lr=LR)
+    # Linear LR decay: ramp from LR down to LR/10 over all updates.
+    # This prevents the policy from over-optimising in the late stage, which
+    # caused the ~13-point reward collapse seen in prior runs.
+    scheduler = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1.0, end_factor=0.1, total_iters=n_updates
+    )
     buffer    = RolloutBuffer()
     env       = UAVTaskEnv(seed=env_seed)
 
@@ -179,6 +199,13 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str,
     last_info  = {}
     timestep   = 0
     episode    = 0
+
+    # Best-model tracking: save the state_dict that achieved the highest
+    # rolling mean reward (window=50 eps).  Prevents returning a degraded
+    # checkpoint when training collapses near the end.
+    best_mean_reward  = -float("inf")
+    best_state_dict   = copy.deepcopy(policy.state_dict())
+    BEST_MODEL_MIN_EP = 50   # require at least this many episodes before tracking
 
     # Training log: list of dicts {step, reward, latency, success}
     train_log: List[Dict] = []
@@ -212,12 +239,17 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str,
 
                 # Save log point every LOG_INTERVAL episodes
                 if episode % LOG_INTERVAL == 0:
+                    mean_r = float(np.mean(ep_rewards))
                     train_log.append({
                         "step":    timestep,
-                        "reward":  float(np.mean(ep_rewards)),
+                        "reward":  mean_r,
                         "latency": float(np.mean(ep_latencies)),
                         "success": float(np.mean(ep_successes)),
                     })
+                    # Track best model (only after warm-up)
+                    if episode >= BEST_MODEL_MIN_EP and mean_r > best_mean_reward:
+                        best_mean_reward = mean_r
+                        best_state_dict  = copy.deepcopy(policy.state_dict())
 
                 if episode % 50 == 0:
                     elapsed = time.time() - t0
@@ -227,6 +259,7 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str,
                         f"  latency={np.mean(ep_latencies):6.1f}ms"
                         f"  success={np.mean(ep_successes):.3f}"
                         f"  fps={timestep/elapsed:.0f}"
+                        f"  lr={scheduler.get_last_lr()[0]:.2e}"
                     )
                 ep_reward = 0.0
                 obs_np, _ = env.reset()
@@ -239,8 +272,15 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str,
                 {k: v.unsqueeze(0) for k, v in obs.items()}
             )
         ppo_update(policy, optimizer, buffer, last_val.item(), device)
+        scheduler.step()
 
     print(f"[{method_tag}] Training complete.")
+    print(f"[{method_tag}] Best rolling mean reward: {best_mean_reward:.3f} "
+          f"(final: {float(np.mean(ep_rewards)):.3f})")
+
+    # Restore best checkpoint (prevents returning a collapsed final policy)
+    policy.load_state_dict(best_state_dict)
+    print(f"[{method_tag}] Restored best checkpoint (reward={best_mean_reward:.3f})")
 
     # Persist training log
     if log_path is not None:

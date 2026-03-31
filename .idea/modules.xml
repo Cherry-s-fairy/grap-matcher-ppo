@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/grap-matcher-dqn.iml" filepath="$PROJECT_DIR$/.idea/grap-matcher-dqn.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/grap-matcher-ppo.iml" filepath="$PROJECT_DIR$/.idea/grap-matcher-ppo.iml" />
     </modules>
   </component>
 </project>

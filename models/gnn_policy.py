@@ -194,8 +194,16 @@ class ActorCriticPolicy(nn.Module):
     """
     Thin Actor-Critic wrapper around DualGraphExtractor.
 
-    action_dim should equal AdaptiveTaskShaper.NUM_ACTIONS (3).
+    action_dim should equal ACTION_DIM (211) for the node-level action space.
+    Includes action masking (same logic as NodeLevelActorCritic) so invalid
+    split/merge actions are excluded during both rollout collection and updates.
     """
+
+    # Pre-compute flat pair indices (same as NodeLevelActorCritic)
+    _PAIR_I: list = [i for i in range(MAX_TASK_NODES)
+                     for j in range(i + 1, MAX_TASK_NODES)]
+    _PAIR_J: list = [j for i in range(MAX_TASK_NODES)
+                     for j in range(i + 1, MAX_TASK_NODES)]
 
     def __init__(self, action_dim: int = 3, features_dim: int = 128):
         super().__init__()
@@ -204,16 +212,56 @@ class ActorCriticPolicy(nn.Module):
         self.actor  = nn.Linear(features_dim, action_dim)
         self.critic = nn.Linear(features_dim, 1)
 
+        pair_i = torch.tensor(self._PAIR_I, dtype=torch.long)
+        pair_j = torch.tensor(self._PAIR_J, dtype=torch.long)
+        self.register_buffer("pair_i", pair_i)
+        self.register_buffer("pair_j", pair_j)
+
     def forward(self, obs: Dict[str, torch.Tensor]):
         feat   = self.extractor(obs)
         logits = self.actor(feat)
         value  = self.critic(feat)
         return logits, value
 
+    def compute_action_mask(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Build (B, action_dim) boolean mask where True = action is valid.
+        Mirrors NodeLevelActorCritic.compute_action_mask exactly.
+        """
+        task_x    = obs["task_x"]     # (B, N, 2)
+        task_edge = obs["task_edge"]  # (B, 2, E)
+        B, N, _   = task_x.shape
+        device    = task_x.device
+
+        is_real  = task_x.abs().sum(-1) > 0                          # (B, N)
+        n_real   = is_real.sum(dim=1)                                 # (B,)
+
+        real_edge_flag = (task_edge[:, 0, :] != task_edge[:, 1, :])  # (B, E)
+        src_idx   = task_edge[:, 0, :].clamp(0, N - 1)
+        src_hot   = F.one_hot(src_idx, num_classes=N).float()
+        src_hot   = src_hot * real_edge_flag.unsqueeze(-1).float()
+        is_source = src_hot.sum(dim=1) > 0                           # (B, N)
+        is_leaf   = is_real & ~is_source                              # (B, N)
+
+        noop_mask  = torch.ones(B, 1, dtype=torch.bool, device=device)
+
+        res_x = obs["res_x"]
+        if res_x.dim() == 2:
+            res_x = res_x.unsqueeze(0)
+        fleet_has_cpu = (res_x[:, :, 0].max(dim=1).values > 0.0).unsqueeze(1)
+        can_split  = (n_real < N).unsqueeze(1) & fleet_has_cpu
+        split_mask = is_real & can_split                              # (B, N)
+
+        merge_mask = is_leaf[:, self.pair_i] & is_leaf[:, self.pair_j]  # (B, C)
+
+        return torch.cat([noop_mask, split_mask, merge_mask], dim=-1)  # (B, action_dim)
+
     def get_action_and_value(self, obs: Dict[str, torch.Tensor]):
         logits, value = self.forward(obs)
-        dist   = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
+        mask          = self.compute_action_mask(obs)
+        masked_logits = logits.masked_fill(~mask, float("-inf"))
+        dist          = torch.distributions.Categorical(logits=masked_logits)
+        action        = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), value
 
 
