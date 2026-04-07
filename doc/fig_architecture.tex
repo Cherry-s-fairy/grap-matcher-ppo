@@ -1,0 +1,238 @@
+% ============================================================
+%  fig_architecture.tex
+%  System architecture figure for Graph-Matcher-PPO
+%  Usage: \input{doc/fig_architecture}  inside figure* environment
+%
+%  Required preamble:
+%    \usepackage{tikz}
+%    \usetikzlibrary{arrows.meta, positioning, fit,
+%                    backgrounds, calc}
+%    \usepackage{amsmath, amssymb}
+% ============================================================
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  >=Stealth,
+  line width=0.55pt,
+  %% ── Node styles ──────────────────────────────────────────
+  % Observation boxes (gray tint)
+  sbox/.style={
+    draw, rectangle, rounded corners=2pt,
+    fill=gray!9, text width=#1,
+    minimum height=0.90cm, align=center
+  }, sbox/.default=3.0cm,
+  % Environment boxes (warm tint)
+  ebox/.style={
+    draw, rectangle, rounded corners=2pt,
+    fill=orange!7, text width=#1,
+    minimum height=0.90cm, align=center
+  }, ebox/.default=2.7cm,
+  % RL Agent box (blue tint, heavier border)
+  abox/.style={
+    draw=black!80, rectangle, rounded corners=3pt,
+    fill=blue!5, line width=0.9pt,
+    text width=11.4cm, minimum height=1.18cm, align=center
+  },
+  % Action strip (white)
+  actbox/.style={
+    draw, rectangle, rounded corners=2pt,
+    fill=white, text width=7.2cm,
+    minimum height=0.62cm, align=center
+  },
+  %% ── Arrow styles ─────────────────────────────────────────
+  arr/.style={->, line width=0.65pt, rounded corners=3pt},
+  darr/.style={->, dashed, line width=0.58pt,
+               gray!70, rounded corners=3pt},
+  fbarr/.style={->, line width=0.80pt, rounded corners=6pt},
+]
+
+%% ═══════════════════════════════════════════════════════════
+%%  ROW 1 — Observation  (y = 6.5)
+%% ═══════════════════════════════════════════════════════════
+
+\node[sbox=3.1cm] (gt) at (2.0, 6.50) {
+  \textbf{Task DAG}\; $\mathcal{G}_T$\\[-1pt]
+  \scriptsize
+  $v_i{:}\,(c_i,\,s_i)$;\enspace
+  $(v_i,v_j){:}\,d_{ij}$
+};
+
+\node[sbox=3.5cm] (gr) at (6.10, 6.50) {
+  \textbf{Resource Graph}\; $\mathcal{G}_R$\\[-1pt]
+  \scriptsize
+  $\mathbf{x}_k^R {=}
+    [\tilde\phi_k/\phi^{\max},\;
+     \bar B_k/B_{\max},\;
+     \beta_k]$
+};
+
+\node[sbox=3.1cm] (fb) at (10.2, 6.50) {
+  \textbf{Feedback}\; $\mathbf{f}(t)\!\in\!\mathbb{R}^6$\\[-1pt]
+  \scriptsize
+  $[\lambda,\,\sigma,\,\varrho,\,
+    \bar u,\,\hat B_{\min},\,\hat\beta_{\min}]$
+};
+
+%% Observation background ────────────────────────────────────
+\begin{scope}[on background layer]
+  \node[draw, dashed, rounded corners=5pt,
+        fill=gray!3, inner sep=8pt,
+        fit=(gt)(gr)(fb)] (obsbox) {};
+\end{scope}
+\node[above=2pt of obsbox,
+      font=\scriptsize\itshape] {Observation $\mathcal{O}(t)$};
+
+%% ═══════════════════════════════════════════════════════════
+%%  ROW 2 — GNN-Based RL Policy  (y = 4.90)
+%% ═══════════════════════════════════════════════════════════
+
+\node[abox] (agent) at (6.10, 4.90) {
+  \textbf{GNN-Based RL Policy}\enspace(PPO)\\[2pt]
+  \scriptsize
+  Task-GNN\enspace$\oplus$\enspace Res-GNN
+  \enspace$\xrightarrow{\;\text{cross-graph attention}\;}$\enspace
+  Actor $\!\rightarrow\! a_t$\enspace;\enspace
+  Critic $\!\rightarrow\! V(s_t)$
+};
+
+%% Arrows: Obs → Agent ────────────────────────────────────────
+\draw[arr] (gt.south)
+  -- ++(0,-.28)
+  -| ([xshift=-2.6cm]agent.north);
+
+\draw[arr] (gr.south)
+  -- ++(0,-.28)
+  -- (agent.north);
+
+\draw[arr] (fb.south)
+  -- ++(0,-.28)
+  -| ([xshift=2.4cm]agent.north);
+
+%% ═══════════════════════════════════════════════════════════
+%%  Action strip  (y = 3.68)
+%% ═══════════════════════════════════════════════════════════
+
+\node[actbox] (act) at (6.10, 3.68) {
+  \scriptsize
+  $a_t \!\in\! \mathcal{A}$:\enspace
+  $\mathtt{noop}$\enspace$\mid$\enspace
+  \textsc{Split}$(v_i)$\enspace$\mid$\enspace
+  \textsc{Merge}$(v_i,\,v_j)$
+};
+
+\draw[arr] (agent.south) -- (act.north)
+  node[midway, right=3pt, font=\scriptsize] {action $a_t$};
+
+%% ═══════════════════════════════════════════════════════════
+%%  ROW 3 — Environment Step  (y = 2.30)
+%% ═══════════════════════════════════════════════════════════
+
+\node[ebox=2.70cm] (shp) at ( 1.50, 2.30) {
+  \textbf{Shaping Ops}\\[-1pt]
+  \scriptsize
+  Split:\enspace$c_i\!\leftarrow\!c_i/2$\\[-2pt]
+  Merge:\enspace$c_i\!\leftarrow\!c_i\!+\!c_j$
+};
+
+\node[ebox=2.30cm] (gtp) at ( 4.45, 2.30) {
+  \textbf{Modified DAG}\\[1pt]
+  $\mathcal{G}_T'$\\[-2pt]
+  \scriptsize $|\mathcal{V}_T'|\!=\!N\!\pm\!1$
+};
+
+\node[ebox=2.75cm] (sch) at ( 7.30, 2.30) {
+  \textbf{Greedy Scheduler}\\[-1pt]
+  \scriptsize\itshape(deterministic)\\[-1pt]
+  \scriptsize
+  topological order\\[-2pt]
+  $+$ BW-aware latency
+};
+
+\node[ebox=2.95cm] (uav) at (10.70, 2.30) {
+  \textbf{UAV Swarm Dyn.}\\[-1pt]
+  \scriptsize
+  Mobility: RWP\\[-2pt]
+  $\mathbf{B}(t)$,\enspace
+  $\tilde{\phi}_k(t)$\\[-2pt]
+  $\beta_k(t{+}1){=}\beta_k(t){-}\Delta\beta_k(t)$
+};
+
+%% Environment background ────────────────────────────────────
+\begin{scope}[on background layer]
+  \node[draw, dashed, rounded corners=5pt,
+        fill=orange!3, inner sep=8pt,
+        fit=(shp)(gtp)(sch)(uav)] (envbox) {};
+\end{scope}
+\node[below=2pt of envbox,
+      font=\scriptsize\itshape] {Environment Step};
+
+%% ═══════════════════════════════════════════════════════════
+%%  Arrows — Action → Shaping → ModDAG → Scheduler
+%% ═══════════════════════════════════════════════════════════
+
+\draw[arr] (act.south)
+  -- ++(0,-.30)
+  -| (shp.north);
+
+\draw[arr] (shp.east)  -- (gtp.west);
+\draw[arr] (gtp.east)  -- (sch.west);
+
+%% ═══════════════════════════════════════════════════════════
+%%  Bidirectional: UAV Swarm ↔ Scheduler
+%%  (resource state into scheduler; consumption out)
+%% ═══════════════════════════════════════════════════════════
+
+%% UAV Swarm → Scheduler: bandwidth & effective CPU
+\draw[darr]
+  (uav.north) -- ++(0,+.55) -| (sch.north)
+  node[pos=0.30, above, font=\scriptsize]
+    {$\mathbf{B}(t),\;\tilde\phi_k(t)$};
+
+%% Scheduler → UAV Swarm: workload for energy depletion
+\draw[darr]
+  (sch.south) -- ++(0,-.42) -| (uav.south)
+  node[pos=0.30, below, font=\scriptsize]
+    {$\rho_k(t),\;\tau_k(t)$};
+
+%% ═══════════════════════════════════════════════════════════
+%%  Feedback loop: UAV Swarm → f(t+1) → Feedback box
+%%  (right-side routing)
+%% ═══════════════════════════════════════════════════════════
+
+\draw[fbarr]
+  (uav.east)
+  -- ++(0.55, 0)
+  -- ++(0,    4.90)
+  -- (fb.east)
+  node[pos=0.50, right=4pt, align=left, font=\scriptsize]
+    {$\mathbf{f}(t{+}1)$\\[-1pt]
+     \scriptsize$\!=\![\lambda,\sigma,\varrho,$\\[-1pt]
+     \scriptsize$\;\bar u,\hat B_{\min},\hat\beta_{\min}]$};
+
+\end{tikzpicture}%
+%% ── Caption ─────────────────────────────────────────────────────────
+\caption{%
+  System architecture of the proposed \textsc{Graph-Matcher-PPO}
+  framework.
+  At each decision epoch $t$, the GNN-based PPO policy processes the
+  joint observation $\mathcal{O}(t)$---comprising the current task DAG
+  $\mathcal{G}_T$, the dynamic resource graph $\mathcal{G}_R$, and the
+  six-dimensional scheduling feedback $\mathbf{f}(t)$---and selects a
+  topology-shaping action $a_t$.
+  The action either decomposes a task via \textsc{Split}$(v_i)$,
+  collapses two tasks via \textsc{Merge}$(v_i, v_j)$, or leaves the
+  graph unchanged (\texttt{noop}), yielding a modified DAG
+  $\mathcal{G}_T'$.
+  The deterministic greedy scheduler then maps $\mathcal{G}_T'$ to a
+  concrete UAV assignment using the instantaneous bandwidth matrix
+  $\mathbf{B}(t)$ and effective CPU vector $\tilde\phi_k(t)$ supplied
+  by the UAV swarm dynamics; the resulting workload
+  $(\rho_k(t), \tau_k(t))$ drives battery depletion
+  $\beta_k(t{+}1)$.
+  The scheduling outcome is encoded into the updated feedback vector
+  $\mathbf{f}(t{+}1)$, closing the adaptive loop.%
+}
+\label{fig:framework}
+\end{figure*}

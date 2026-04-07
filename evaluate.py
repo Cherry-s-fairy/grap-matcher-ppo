@@ -204,7 +204,7 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str,
     # rolling mean reward (window=50 eps).  Prevents returning a degraded
     # checkpoint when training collapses near the end.
     best_mean_reward  = -float("inf")
-    best_state_dict   = copy.deepcopy(policy.state_dict())
+    best_state_dict   = None          # None until first qualifying checkpoint
     BEST_MODEL_MIN_EP = 50   # require at least this many episodes before tracking
 
     # Training log: list of dicts {step, reward, latency, success}
@@ -275,12 +275,16 @@ def train_rl(policy, env_seed: int, device: torch.device, method_tag: str,
         scheduler.step()
 
     print(f"[{method_tag}] Training complete.")
+    final_mean = float(np.mean(ep_rewards)) if ep_rewards else 0.0
     print(f"[{method_tag}] Best rolling mean reward: {best_mean_reward:.3f} "
-          f"(final: {float(np.mean(ep_rewards)):.3f})")
+          f"(final: {final_mean:.3f})")
 
     # Restore best checkpoint (prevents returning a collapsed final policy)
-    policy.load_state_dict(best_state_dict)
-    print(f"[{method_tag}] Restored best checkpoint (reward={best_mean_reward:.3f})")
+    if best_state_dict is not None:
+        policy.load_state_dict(best_state_dict)
+        print(f"[{method_tag}] Restored best checkpoint (reward={best_mean_reward:.3f})")
+    else:
+        print(f"[{method_tag}] No best checkpoint saved (warm-up not reached); keeping final weights.")
 
     # Persist training log
     if log_path is not None:

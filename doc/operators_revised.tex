@@ -1,0 +1,153 @@
+% ============================================================
+%  Graph Shaping Operators — compact subsection
+%  Required preamble: \usepackage{amsmath,amssymb,enumitem}
+%
+%  Notation:
+%    c_i, s_i        : CPU demand and data volume of v_i
+%    c_i^*, s_i^*    : pre-operation values (avoid update-order ambiguity)
+%    \delta_{pq}     : transfer volume on edge (v_p, v_q) [MB]
+%    \Pi(v), \Sigma(v): predecessor / successor sets in the current DAG
+%    \tilde\phi_k    : battery-derated CPU capacity of UAV u_k
+%    B_{kl}(n)       : link bandwidth between u_k and u_l at epoch n
+%    \kappa          : latency scaling constant [ms / (demand/capacity)]
+% ============================================================
+
+\subsubsection{Graph Shaping Operators}
+\label{subsubsec:operators}
+
+The RTGS agent controls the microservice graph through two complementary
+primitives.
+Both operators produce a modified copy
+$\mathcal{G}_T' = (\mathcal{V}_T',\mathcal{E}_T')$
+without altering the original graph,
+so that an infeasible (masked) action is a no-op.
+
+% ----------------------------------------------------------------
+\smallskip
+\noindent\textbf{Definition 1 (Split).}
+\emph{Given $v_i \in \mathcal{V}_T$ with $|\mathcal{V}_T| < N_{\max}$,
+$\textsc{Split}(v_i)$ introduces a sibling node $v_i^{+}$ and
+partitions $v_i$'s workload between the two sub-tasks as follows.}
+
+\smallskip
+\noindent\textit{Attribute bisection.}
+Denoting the pre-operation values by $(\cdot)^*$, both sub-tasks
+receive equal shares:
+\begin{equation}
+  c_i \leftarrow \tfrac{c_i^*}{2},\quad
+  s_i \leftarrow \tfrac{s_i^*}{2},\quad
+  c_{i^+} = \tfrac{c_i^*}{2},\quad
+  s_{i^+} = \tfrac{s_i^*}{2}.
+  \label{eq:split_attr}
+\end{equation}
+The equal partition is optimal in a minimax sense.
+For a general split ratio $\alpha \in (0,1)$, the two sub-tasks execute
+concurrently on UAVs with minimum effective CPU $\tilde\phi_{\min}$,
+so the critical-path latency of the pair is
+$L_{\mathrm{split}}(\alpha)
+= \kappa\,\max(\alpha,1-\alpha)\,c_i^*/\tilde\phi_{\min}$.
+Since $\max(\alpha,1-\alpha)$ is uniquely minimised at $\alpha^*=\tfrac{1}{2}$,
+equal bisection minimises the worst-case sub-task execution time
+and yields a latency of $\kappa c_i^*/(2\tilde\phi_{\min})$—exactly
+half the pre-split value.
+
+\smallskip
+\noindent\textit{Topology update.}
+The sibling inherits the complete neighbourhood of $v_i$ via a
+\emph{broadcast} edge-replication model:
+\begin{equation}
+  \mathcal{V}_T' = \mathcal{V}_T \cup \{v_i^{+}\},
+  \label{eq:split_vset}
+\end{equation}
+\begin{equation}
+  \mathcal{E}_T' = \mathcal{E}_T
+    \;\cup\; \bigl\{(v_p,\,v_i^{+}): v_p \in \Pi(v_i)\bigr\}
+    \;\cup\; \bigl\{(v_i^{+},\,v_s): v_s \in \Sigma(v_i)\bigr\},
+  \label{eq:split_edges}
+\end{equation}
+with $\delta_{p,i^+} = \delta_{pi}$ and $\delta_{i^+,s} = \delta_{is}$
+preserved on every replicated edge.
+Each predecessor broadcasts its full output to both sub-tasks;
+successors implement a fork–join barrier awaiting both.
+No edge is inserted between $v_i$ and $v_i^{+}$, so the two sub-tasks
+are topologically independent and schedulable on \emph{distinct} UAVs
+within the same round, exposing inter-UAV parallelism.
+Since every edge incident to $v_i^{+}$ mirrors an edge of $v_i$,
+any directed cycle through $v_i^{+}$ in $\mathcal{G}_T'$ would imply
+a cycle through $v_i$ in $\mathcal{G}_T$; acyclicity is therefore preserved.
+
+% ----------------------------------------------------------------
+\smallskip
+\noindent\textbf{Definition 2 (Merge).}
+\emph{Given two distinct nodes $v_i, v_j \in \mathcal{V}_T$,
+$\textsc{Merge}(v_i,v_j)$ co-locates their execution to eliminate the
+cross-UAV data transfer $\delta_{ij}$, subject to the following
+acyclicity guard:
+\begin{equation}
+  \nexists\;\text{path}\;v_i\!\leadsto\!v_j
+  \quad\text{and}\quad
+  \nexists\;\text{path}\;v_j\!\leadsto\!v_i.
+  \label{eq:cycle_guard}
+\end{equation}
+If \eqref{eq:cycle_guard} holds, the operation proceeds as follows.}
+
+\smallskip
+\noindent\textit{Attribute absorption.}
+The workload of $v_j$ is absorbed additively into $v_i$:
+\begin{equation}
+  c_i \leftarrow c_i + c_j, \qquad s_i \leftarrow s_i + s_j.
+  \label{eq:merge_attr}
+\end{equation}
+The merged node represents the sequential composition of both services
+and requires a UAV with residual CPU $\tilde\phi_k \geq c_i^* + c_j^*$.
+
+\smallskip
+\noindent\textit{Topology update.}
+Let $\mathcal{E}_j = \{e \in \mathcal{E}_T : v_j \in e\}$.
+To avoid self-loops and duplicate edges, define the valid redirect sets:
+\begin{align}
+  \mathcal{P}_j^{\star} &=
+    \bigl\{v_p \in \Pi(v_j) : v_p \neq v_i,\;(v_p,v_i)\notin\mathcal{E}_T\bigr\},
+  \label{eq:Pj}\\
+  \mathcal{S}_j^{\star} &=
+    \bigl\{v_s \in \Sigma(v_j) : v_s \neq v_i,\;(v_i,v_s)\notin\mathcal{E}_T\bigr\}.
+  \label{eq:Sj}
+\end{align}
+The updated edge set and vertex set are:
+\begin{equation}
+  \mathcal{E}_T' =
+    \bigl(\mathcal{E}_T \setminus \mathcal{E}_j\bigr)
+    \cup \bigl\{(v_p,v_i): v_p\in\mathcal{P}_j^{\star}\bigr\}
+    \cup \bigl\{(v_i,v_s): v_s\in\mathcal{S}_j^{\star}\bigr\},
+  \label{eq:merge_edges}
+\end{equation}
+\begin{equation}
+  \mathcal{V}_T' = \mathcal{V}_T \setminus \{v_j\},
+  \label{eq:merge_vset}
+\end{equation}
+with transfer volumes $\delta_{p,i}=\delta_{pj}$ and
+$\delta_{i,s}=\delta_{js}$ inherited on redirected edges.
+The guard \eqref{eq:cycle_guard} is both necessary and sufficient
+for $\mathcal{G}_T'$ to remain a DAG: if a directed path
+$v_i\!\leadsto\!v_j$ existed, redirecting $v_j$'s predecessor
+$w_{m-1}$ to $v_i$ would close the cycle
+$v_i\!\to\!\cdots\!\to\!w_{m-1}\!\to\!v_i$;
+conversely, absence of any such path prevents any new cycle from forming.
+
+\smallskip
+\noindent\textit{Net scheduling benefit.}
+Merging replaces the inter-UAV transfer latency
+$L_{ij}^{\mathrm{com}}=\delta_{ij}\cdot10^3/B_{kl}(n)$\,(ms)
+with additional serialised compute
+$\Delta L^{\mathrm{exec}}=\kappa c_j^*
+  ({\tilde\phi_k^{-1}}-{\tilde\phi_l^{-1}})$,
+where $u_k$ absorbs $v_j$'s workload and $u_l$ is freed.
+The operation improves the makespan whenever
+\begin{equation}
+  \frac{\delta_{ij}\cdot 10^3}{B_{kl}(n)}
+  > \kappa c_j^*\!\left(\frac{1}{\tilde\phi_k} - \frac{1}{\tilde\phi_l}\right),
+  \label{eq:merge_benefit}
+\end{equation}
+i.e., when link $B_{kl}(n)$ is weak relative to the available compute
+headroom—precisely the scenario signalled by a low cross-attention
+dot product $q_{ij}=\boldsymbol{\Alpha}_i\cdot\boldsymbol{\Alpha}_j$.

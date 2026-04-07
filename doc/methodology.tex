@@ -1,0 +1,478 @@
+% ============================================================
+%  IV. Proposed RTGS Methodology（提出的 RTGS 方法）
+%  中文版本，IEEE 双栏格式
+%  符号体系与 Section III (system_description.tex) 保持一致：
+%    v_i  = 任务节点      u_k  = 无人机      t = 决策时刻
+%    \mathcal{G}_T        = 任务 DAG
+%    \mathcal{G}_R        = 资源图
+%    \mathbf{f}(t)        = 六维调度反馈向量
+%  所有常量均对应代码：
+%    configs/params.py  · models/gnn_policy.py  · env/uav_env.py
+%    core/task_shaping.py · core/mobility.py    · main.py
+% ============================================================
+
+\section{提出的RTGS方法}
+\label{sec:method}
+
+本节将资源感知任务图整形问题（RTGS）形式化为马尔可夫决策过程（MDP），
+并详细阐述求解该MDP的双图GNN–PPO框架。
+在每个决策时刻$t$，智能体观测任务DAG $\mathcal{G}_T$
+与资源图$\mathcal{G}_R$的联合编码状态，
+输出一个图整形动作，
+由确定性贪心调度器完成任务–无人机匹配后，
+环境向智能体反馈奖励信号与更新后的状态，
+形成如图~\ref{fig:architecture}所示的闭环控制流。
+
+% ----------------------------------------------------------------
+\subsection{MDP问题建模}
+\label{subsec:mdp}
+
+\subsubsection*{状态空间 $\mathcal{S}$}
+
+系统状态$s_t \in \mathcal{S}$为一个复合观测，
+由三个子组件拼合构成
+（对应 \texttt{env/uav\_env.py} 中 \texttt{\_get\_obs()} 函数
+以及 \texttt{UAVTaskEnv.observation\_space}）。
+
+\begin{enumerate}[label=(\roman*), leftmargin=*, itemsep=3pt]
+
+  \item \textbf{任务DAG观测}：节点特征矩阵
+        $\mathbf{X}^T \in \mathbb{R}^{N_{\max} \times 2}$
+        与COO格式边索引
+        $\mathbf{E}^T \in \mathbb{Z}^{2 \times N_{\max}^2}$，
+        节点数上限$N_{\max} = 20$，
+        实际节点数$N_t \leq N_{\max}$，
+        不足部分以零行填充。
+        每行特征$\mathbf{x}_i^T = (c_i, s_i)$与
+        第~\ref{sec:system}节式~\eqref{eq:task_attr}中的定义保持一致。
+
+  \item \textbf{资源图观测}：
+        由移动性模型动态生成的节点特征矩阵
+        $\mathbf{X}^R(t) \in [0,1]^{M \times 3}$
+        及全连接边索引$\mathbf{E}^R$；
+        第$k$行特征向量的定义见式~\eqref{eq:res_features}：
+        \begin{equation}
+          \mathbf{x}_k^R(t) =
+          \Bigl[\,
+            \tilde{\phi}_k(t)/\phi^{\max},\;
+            \bar{B}_k(t)/B_{\max},\;
+            \beta_k(t)
+          \,\Bigr]^\top.
+          \label{eq:res_feat_method}
+        \end{equation}
+        三个分量分别表示
+        电量修正后的CPU比率（对应 \texttt{effective\_cpu()} 函数）、
+        至活跃邻居的平均链路带宽比以及当前电量，
+        均归一化至$[0,1]$。
+
+  \item \textbf{调度反馈向量}：
+        六维向量$\mathbf{f}(t) \in \mathbb{R}^6$
+        的定义见式~\eqref{eq:feedback}，
+        由 \texttt{SchedulingFeedback.as\_vector()} 输出，
+        编码了上一轮调度的延迟比$\lambda(t)$、
+        任务成功率$\sigma(t)$、强制重调度次数$\varrho(t)$、
+        机队平均利用率$\bar{u}(t)$、
+        最弱活跃链路带宽比$\hat{B}_{\min}(t)$
+        以及最低电量比$\hat{\beta}_{\min}(t)$六个信号。
+\end{enumerate}
+
+完整状态可紧凑地表示为
+\begin{equation}
+  s_t = \bigl(
+    \mathbf{X}^T,\;\mathbf{E}^T,\;
+    \mathbf{X}^R(t),\;\mathbf{E}^R,\;
+    \mathbf{f}(t)
+  \bigr).
+  \label{eq:state}
+\end{equation}
+
+\subsubsection*{动作空间 $\mathcal{A}$}
+
+动作空间为有限离散集（对应 \texttt{configs/params.py} 中常量
+\texttt{ACTION\_DIM}）：
+\begin{equation}
+  |\mathcal{A}| = 1 + N_{\max} + \binom{N_{\max}}{2}
+               = 1 + 20 + 190 = 211.
+  \label{eq:action_dim}
+\end{equation}
+三类动作的具体定义如下：
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item $a = 0$：\textbf{空操作（noop）}，图拓扑保持不变。
+  \item $a \in \{1,\ldots,20\}$：
+        \textbf{Split$(v_{a-1})$}，
+        对填充位置第$a$个节点执行第~\ref{subsec:task_shaping}节
+        所定义的\textsc{Split}算子。
+  \item $a \in \{21,\ldots,210\}$：
+        \textbf{Merge$(v_i, v_j)$}，
+        对第$(a-21)$个节点对（按字典序枚举全部$\binom{20}{2}$对）
+        执行\textsc{Merge}算子。
+\end{itemize}
+平坦动作索引到操作类型与节点位置三元组
+$(op,\, \text{pad}_i,\, \text{pad}_j)$的解码
+由 \texttt{decode\_node\_action()} 函数实现
+（\texttt{configs/params.py:81--99}）。
+
+\subsubsection*{奖励函数 $\mathcal{R}$}
+
+奖励函数$r_t$由多个分量叠加而成
+（对应 \texttt{env/uav\_env.py:311--336}
+中 \texttt{\_compute\_reward()} 函数），
+旨在同时激励即时调度质量与增量性能改进：
+\begin{equation}
+  r_t = r_{\text{qual}} + r_{\Delta} + r_{\text{pen}}.
+  \label{eq:reward}
+\end{equation}
+
+\noindent\textbf{绝对质量项}：对当前步调度质量给予正向激励，
+使智能体在维持良好性能时仍能获得持续奖励：
+\begin{equation}
+  r_{\text{qual}} = 2\,\sigma(t) + 1.5\,\max\!\bigl(0,\, 1 - \lambda(t)\bigr).
+  \label{eq:reward_qual}
+\end{equation}
+
+\noindent\textbf{增量改进项}：激励相对于前一决策步的性能提升，
+惩罚性能退化：
+\begin{equation}
+  r_{\Delta} = \bigl(\lambda(t-1) - \lambda(t)\bigr)
+             + 0.5\,\bigl(\sigma(t) - \sigma(t-1)\bigr),
+  \label{eq:reward_delta}
+\end{equation}
+延迟比降低（延迟改善）和成功率提升均产生正向增量奖励。
+
+\noindent\textbf{惩罚项}：包含三个负向分量：
+\begin{equation}
+  r_{\text{pen}} =
+    -\frac{\varrho(t)}{N_t}
+    - 2\,\max\!\bigl(0,\, \lambda(t)-1\bigr)
+    - 0.05\,\max\!\bigl(0,\, N_t - 18\bigr).
+  \label{eq:reward_pen}
+\end{equation}
+三项分别对应
+（1）按图规模$N_t$归一化的强制重调度代价，
+消除图越大绝对重调度次数天然越多的偏差；
+（2）超出截止时限$T_D$的平滑线性惩罚，
+取代硬截断以维持梯度连续性；
+（3）拓扑膨胀惩罚，防止智能体通过无限分裂膨胀图规模
+（阈值设为18，低于$N_{\max}=20$，为正常整形保留空间）。
+
+% ----------------------------------------------------------------
+\subsection{双图GNN架构}
+\label{subsec:gnn}
+
+状态$s_t$中的双图结构由三个神经网络子模块协同编码：
+任务图节点编码器、资源图节点编码器，
+以及将两图表示空间桥接起来的跨图注意力模块。
+整体网络对应 \texttt{models/gnn\_policy.py}
+中的 \texttt{NodeLevelActorCritic} 类。
+
+\subsubsection*{节点级GNN编码器}
+
+两个独立的 \texttt{\_GNNNodeEncoder}
+（\texttt{gnn\_policy.py:276--333}）
+分别对任务图与资源图进行编码。
+编码器采用$L=2$层GraphSAGE~\cite{hamilton2017inductive}，
+隐层维度$d_h = 64$，
+最终经线性投影层映射至$d = 32$维嵌入空间。
+与图级分类任务不同，编码器\emph{不执行}全局均值池化，
+直接输出逐节点嵌入矩阵：
+\begin{align}
+  \mathbf{H}^T &= \textsc{GNN}_\tau\!\bigl(\mathbf{X}^T,\,\mathbf{E}^T\bigr)
+    \in \mathbb{R}^{B \times N_{\max} \times d},
+  \label{eq:task_enc}\\[3pt]
+  \mathbf{H}^R &= \textsc{GNN}_r\!\bigl(\mathbf{X}^R,\,\mathbf{E}^R\bigr)
+    \in \mathbb{R}^{B \times M \times d}.
+  \label{eq:res_enc}
+\end{align}
+填充节点的零特征行在编码后被掩码清零，
+防止其通过聚合操作污染有效节点的表示
+（\texttt{gnn\_policy.py:463}）。
+
+\subsubsection*{跨图注意力机制}
+
+\texttt{CrossGraphAttention}（\texttt{gnn\_policy.py:340--380}）
+实现从资源图到任务图的单头交叉注意力：
+对每个任务节点$v_i$，
+以其嵌入为查询，以全体无人机嵌入为键值对，
+计算一个资源感知的上下文向量。
+具体地，查询、键、值矩阵分别为
+\begin{align}
+  \mathbf{Q} &= \mathbf{H}^T\mathbf{W}_Q
+    \in \mathbb{R}^{B \times N_{\max} \times d},
+  \label{eq:cross_Q}\\
+  \mathbf{K} &= \mathbf{H}^R\mathbf{W}_K
+    \in \mathbb{R}^{B \times M \times d},
+  \label{eq:cross_K}\\
+  \mathbf{V} &= \mathbf{H}^R\mathbf{W}_V
+    \in \mathbb{R}^{B \times M \times d},
+  \label{eq:cross_V}
+\end{align}
+注意力权重矩阵为
+\begin{equation}
+  \boldsymbol{\Alpha} =
+    \mathrm{softmax}\!\left(
+      \frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d}}
+    \right) \in \mathbb{R}^{B \times N_{\max} \times M},
+  \label{eq:attn_weights}
+\end{equation}
+其中$\Alpha_{b,i,k}$可被解释为
+任务节点$v_i$对无人机$u_k$的软归属权重，
+反映当前资源状态下$v_i$最可能被调度至哪台无人机。
+资源增强的任务节点嵌入通过残差连接得到：
+\begin{equation}
+  \tilde{\mathbf{H}}^T =
+    \mathbf{H}^T +
+    \textsc{OutProj}\!\bigl(\boldsymbol{\Alpha}\mathbf{V}\bigr)
+    \in \mathbb{R}^{B \times N_{\max} \times d}.
+  \label{eq:enriched}
+\end{equation}
+注意力权重矩阵$\boldsymbol{\Alpha}$被完整保留
+并传递至后续的合并评分头，
+作为任务节点对之间链路质量的代理信号
+（详见第~\ref{subsec:ppo}节）。
+
+\subsubsection*{全局状态聚合}
+
+全局状态向量$\mathbf{g}$汇聚双图信息与反馈信号，
+用于驱动值函数头与空操作评分头
+（\texttt{\_encode()} 函数，\texttt{gnn\_policy.py:458--494}）：
+\begin{equation}
+  \mathbf{g} = \Bigl[
+    \bar{\mathbf{h}}^T_{\text{real}}\;\Big\|\;
+    \bar{\mathbf{h}}^R\;\Big\|\;
+    \mathbf{b}_{\text{res}}\;\Big\|\;
+    \mathbf{f}(t)
+  \Bigr] \in \mathbb{R}^{76},
+  \label{eq:global_state}
+\end{equation}
+其中$\bar{\mathbf{h}}^T_{\text{real}}$为对真实（非填充）任务节点
+求掩码均值所得的$d$维向量，
+$\bar{\mathbf{h}}^R$为资源节点的均值嵌入，
+$\mathbf{f}(t) \in \mathbb{R}^6$为调度反馈向量。
+\emph{资源瓶颈向量}定义为
+\begin{equation}
+  \mathbf{b}_{\text{res}} =
+  \Bigl[
+    \min_k \mathbf{x}_k^R(t)\;\Big\|\;
+    \frac{1}{M}\sum_k \mathbf{x}_k^R(t)
+  \Bigr] \in \mathbb{R}^6,
+  \label{eq:res_bottleneck}
+\end{equation}
+其最小值分量显式保留了机队中最薄弱无人机的状态，
+防止均值聚合将单点故障信号淹没，
+从而使值函数对个别无人机失效场景保持敏感
+（\texttt{gnn\_policy.py:474--480}）。
+
+% ----------------------------------------------------------------
+\subsection{基于PPO的决策模块}
+\label{subsec:ppo}
+
+\subsubsection*{三头式动作Logit生成}
+
+RTGS策略网络对式~\eqref{eq:action_dim}中的三类动作
+分别使用独立评分头产生logit，
+从而捕获不同粒度的动作语义
+（\texttt{NodeLevelActorCritic.forward()}，
+\texttt{gnn\_policy.py:499--536}）。
+
+\smallskip
+\noindent\textbf{空操作头}
+以全局状态向量$\mathbf{g}$为输入，
+输出单个标量logit：
+\begin{equation}
+  z_{\text{noop}} = \mathbf{w}_{\text{noop}}^\top \mathbf{g}
+    \in \mathbb{R}.
+  \label{eq:noop_logit}
+\end{equation}
+
+\smallskip
+\noindent\textbf{分裂头}
+以资源增强节点嵌入$\tilde{\mathbf{H}}^T$为输入，
+对每个任务节点独立产生评分：
+\begin{equation}
+  \mathbf{z}_{\text{split}} =
+    \tilde{\mathbf{H}}^T\,\mathbf{w}_{\text{split}}
+    \in \mathbb{R}^{N_{\max}}.
+  \label{eq:split_logit}
+\end{equation}
+由于$\tilde{\mathbf{H}}^T$已通过跨图注意力编码了任务节点
+与各无人机的软归属关系，
+智能体得以学习优先选择
+由高CPU容量无人机承接的节点实施分裂。
+
+\smallskip
+\noindent\textbf{合并头}
+为每个候选节点对$(v_i, v_j)$引入
+\emph{链路质量信号}：
+\begin{equation}
+  q_{ij} =
+    \boldsymbol{\Alpha}_i \cdot \boldsymbol{\Alpha}_j
+  = \sum_{k=1}^{M} \Alpha_{ik}\,\Alpha_{jk} \in [0, 1].
+  \label{eq:link_quality}
+\end{equation}
+$q_{ij}$高意味着$v_i$与$v_j$均主要关注同一台无人机，
+两者可被同机执行而无需跨UAV传输，合并收益较低；
+$q_{ij}$低则意味着两节点被分配至链路质量可能较差的不同无人机，
+合并操作可消除该跨链路数据传输，从而降低端到端延迟。
+合并logit由两层MLP计算：
+\begin{equation}
+  z_{ij}^{\text{merge}} =
+    \textsc{MLP}_{\text{merge}}\!\bigl(
+      [\,\tilde{\mathbf{h}}_i\;\|\;\tilde{\mathbf{h}}_j\;\|\;q_{ij}\,]
+    \bigr) \in \mathbb{R},
+  \label{eq:merge_logit}
+\end{equation}
+MLP输入维度为$2d + 1 = 65$
+（\texttt{gnn\_policy.py:445--448}，
+\texttt{merge\_head} 的结构为
+$65 \to d \to 1$，中间采用ReLU激活）。
+
+三组logit在动作维度上拼接，构成完整的动作评分向量：
+\begin{equation}
+  \mathbf{z} =
+    \bigl[z_{\text{noop}}\;\|\;
+          \mathbf{z}_{\text{split}}\;\|\;
+          \mathbf{z}_{\text{merge}}\bigr]
+    \in \mathbb{R}^{211}.
+  \label{eq:all_logits}
+\end{equation}
+
+\subsubsection*{动作掩码}
+
+为防止策略输出结构非法的图操作，
+在Categorical采样前将无效动作的logit置为$-\infty$
+（\texttt{compute\_action\_mask()}，
+\texttt{gnn\_policy.py:539--584}）。
+合法性规则如下：
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item \textbf{Noop}：恒为合法。
+  \item \textbf{Split$(v_i)$}：当且仅当
+        $v_i$为真实（非填充）节点、
+        $N_t < N_{\max}$（图未满）
+        且机队至少有一台无人机具有可用算力
+        $\bigl(\max_k \tilde{\phi}_k(t) > 0\bigr)$时合法。
+  \item \textbf{Merge$(v_i, v_j)$}：当且仅当
+        $v_i$与$v_j$均为真实叶节点
+        （在当前DAG中出度为零）时合法。
+\end{itemize}
+将布尔掩码记为$\mathbf{m} \in \{0,1\}^{211}$，
+动作采样由掩码后的分布完成：
+\begin{equation}
+  a_t \sim \mathrm{Categorical}\!\bigl(
+    \mathrm{softmax}(\mathbf{z} + \log \mathbf{m})
+  \bigr),
+  \label{eq:masked_sample}
+\end{equation}
+其中$\log 0 = -\infty$对应被屏蔽的无效动作。
+掩码在策略回滚收集与PPO更新两个阶段均一致应用，
+确保旧策略与新策略的对数概率计算在相同支撑集上进行
+（\texttt{main.py:123--126}）。
+
+\subsubsection*{PPO训练细节}
+
+策略网络使用近端策略优化（PPO）算法~\cite{schulman2017proximal}
+进行端到端训练
+（\texttt{main.py:93--143}，\texttt{ppo\_update()} 函数）。
+智能体首先收集$T_r = 2048$步滚动轨迹（约41个完整回合），
+再对策略执行$K = 4$个更新轮次，
+每轮次使用随机划分的小批量（大小$B_{\text{mb}} = 128$）
+进行梯度更新。
+
+复合损失函数为
+\begin{equation}
+  \mathcal{L} =
+    \mathcal{L}_{\text{actor}}
+    + c_v\,\mathcal{L}_{\text{critic}}
+    - c_H\,\mathcal{H}(\pi),
+  \label{eq:ppo_loss}
+\end{equation}
+其中actor损失采用PPO截断代理目标：
+\begin{equation}
+  \mathcal{L}_{\text{actor}} =
+    -\,\mathbb{E}_t\!\left[
+      \min\!\Bigl(
+        \rho_t\,\hat{A}_t,\;
+        \mathrm{clip}(\rho_t,\,1-\epsilon,\,1+\epsilon)\,\hat{A}_t
+      \Bigr)
+    \right],
+  \label{eq:ppo_actor}
+\end{equation}
+$\rho_t = \pi_\theta(a_t|s_t)/\pi_{\theta_{\mathrm{old}}}(a_t|s_t)$
+为新旧策略比率，
+$\hat{A}_t$为归一化优势估计
+$\bigl(\hat{A}_t \leftarrow (A_t - \mu_A)/(\sigma_A + \epsilon_0)\bigr)$，
+截断系数$\epsilon = 0.2$；
+critic损失为均方误差：
+\begin{equation}
+  \mathcal{L}_{\text{critic}} =
+    \mathbb{E}_t\!\bigl[
+      \bigl(V_\theta(s_t) - R_t\bigr)^2
+    \bigr],
+  \label{eq:ppo_critic}
+\end{equation}
+其中$R_t = \sum_{l \geq 0} \gamma^l r_{t+l}$为折扣累积回报
+（折扣因子$\gamma = 0.99$）。
+权重系数为$c_v = 0.5$、$c_H = 0.05$；
+熵正则项$\mathcal{H}(\pi)$在211维动作空间中
+显式鼓励探索，防止策略过早收敛至局部最优。
+所有参数梯度以$\ell_2$范数上限$0.5$裁剪，
+以保证大动作空间下的训练稳定性（\texttt{main.py:141}）。
+总训练步数为$2\times10^6$步。
+
+% ----------------------------------------------------------------
+\subsection{RTGS完整决策流程}
+\label{subsec:rtgs_flow}
+
+每个决策时刻$t$的完整执行序列如下，
+对应 \texttt{env/uav\_env.py:248--308}
+中的 \texttt{step()} 方法：
+
+\begin{enumerate}[label=\textbf{\arabic*.}, leftmargin=*, itemsep=4pt]
+
+  \item \textbf{动作解码}：
+        将平坦动作索引$a_t$通过
+        \texttt{decode\_node\_action()} 解码为
+        三元组$(op,\,\mathrm{pad}_i,\,\mathrm{pad}_j)$，
+        再映射至图中实际节点ID $(v_i, v_j)$。
+
+  \item \textbf{图整形}：
+        调用 \texttt{AdaptiveTaskShaper.shape\_targeted()}，
+        对$\mathcal{G}_T$执行
+        \textsc{Split}$(v_i)$或\textsc{Merge}$(v_i, v_j)$算子，
+        得到整形后的图$\mathcal{G}_T'$。
+
+  \item \textbf{移动性感知贪心调度}：
+        以当前带宽矩阵$\mathbf{B}(t)$
+        （由式~\eqref{eq:bandwidth}计算）
+        和有效CPU向量$\tilde{\boldsymbol{\phi}}(t)$
+        （由式~\eqref{eq:cpu_derating}计算）为输入，
+        执行 \texttt{greedy\_match()}，
+        按拓扑序依次将每个任务分配至剩余CPU最多的无人机，
+        返回makespan $T_{\mathrm{span}}(t)$、
+        成功率$\sigma(t)$、
+        重调度次数$\varrho(t)$等调度结果。
+
+  \item \textbf{能量扣除}：
+        按式~\eqref{eq:energy_depletion}
+        根据本轮调度所产生的CPU消耗$\rho_k(t)$
+        与传输量$\tau_k(t)$更新各无人机电量$\beta_k(t)$。
+
+  \item \textbf{移动性推进}：
+        按式~\eqref{eq:rwp}
+        推进各活跃无人机的位置$\mathbf{p}_k(t+1)$，
+        为下一时刻生成新的带宽矩阵$\mathbf{B}(t+1)$。
+
+  \item \textbf{反馈更新与奖励计算}：
+        构造新的调度反馈向量$\mathbf{f}(t)$，
+        按式~\eqref{eq:reward}计算奖励$r_t$，
+        并检查终止条件：
+        若$T_{\mathrm{span}}(t) > 2\,T_D$则判定为灾难性失败并终止回合；
+        若步数达到$T_{\max} = 50$则截断。
+
+\end{enumerate}
+
+上述流程构成RTGS的完整闭环：
+每次图整形决策直接改变后续调度的任务粒度与并行度，
+进而影响延迟与利用率，
+并通过奖励信号反哺策略梯度更新，
+使智能体逐步学会在动态异构UAV群环境下
+做出最优的图拓扑自适应策略。

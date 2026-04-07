@@ -1,0 +1,519 @@
+% ============================================================
+%  III. System Description
+%  IEEE double-column format — passive / third-person voice only
+%  Symbols: v_i = task node  |  u_k = UAV  |  t = decision epoch
+%  All constants verified against:
+%    configs/params.py · core/mobility.py · env/uav_env.py
+%    core/task_shaping.py
+% ============================================================
+
+\section{System Description}
+\label{sec:system}
+
+The system under consideration consists of a swarm of $M$
+heterogeneous UAVs tasked with executing a latency-sensitive
+computational workload represented as a directed acyclic graph (DAG).
+Unlike conventional offloading frameworks that treat the task graph
+as a fixed input, the proposed approach allows the DAG topology itself
+to be \emph{adaptively reshaped} at each decision epoch in response
+to the dynamic resource state of the swarm.
+The remainder of this section formalises the four core components of
+the system: the task and shaping model, the heterogeneous swarm
+representation, the mobility and communication model, and the latency
+and energy consumption model.
+
+% ----------------------------------------------------------------
+\subsection{Task and Shaping Model}
+\label{subsec:task_shaping}
+
+\subsubsection*{Task DAG}
+
+The workload is modelled as a DAG
+\begin{equation}
+  \mathcal{G}_T = \bigl(\mathcal{V}_T,\;\mathcal{E}_T\bigr),
+  \label{eq:task_dag}
+\end{equation}
+where $\mathcal{V}_T = \{v_1, v_2, \ldots, v_N\}$ is the ordered set
+of computational tasks and
+$\mathcal{E}_T \subseteq \mathcal{V}_T \times \mathcal{V}_T$ is the
+set of directed data-dependency edges.
+A directed edge $(v_i, v_j) \in \mathcal{E}_T$ indicates that the
+output of $v_i$ must be transmitted to the executor of $v_j$ before
+$v_j$ may commence.
+The acyclic structure guarantees a well-defined topological execution
+order.
+
+Each task $v_i \in \mathcal{V}_T$ is characterised by the attribute
+pair
+\begin{equation}
+  \mathbf{x}_i^T = \bigl(c_i,\; s_i\bigr),
+  \label{eq:task_attr}
+\end{equation}
+where $c_i > 0$ is the \emph{CPU demand} (processing units required)
+and $s_i > 0$ is the \emph{local data volume} (MB).
+Each edge $(v_i, v_j)$ carries a \emph{transfer volume}
+$d_{ij} \geq 0$ (MB), representing the intermediate result that must
+be communicated from the UAV executing $v_i$ to the UAV executing
+$v_j$.
+The predecessor and successor sets of $v_i$ are denoted
+$\Pi(v_i) = \{v_p : (v_p, v_i) \in \mathcal{E}_T\}$ and
+$\Sigma(v_i) = \{v_s : (v_i, v_s) \in \mathcal{E}_T\}$,
+respectively.
+
+\subsubsection*{Topology Shaping Operations}
+
+The central premise of the framework is that the granularity of task
+parallelism encoded in $\mathcal{G}_T$ should adapt to the
+instantaneous resource state of the swarm.
+Two graph-transformation primitives are defined to this end.
+
+\smallskip
+\noindent\textbf{Definition 1 (Split).}
+\emph{Given} $\mathcal{G}_T = (\mathcal{V}_T, \mathcal{E}_T)$
+\emph{and a target node} $v_i \in \mathcal{V}_T$
+\emph{with} $|\mathcal{V}_T| < N_{\max}$,
+\emph{the} \textsc{Split}$(v_i)$
+\emph{operation produces}
+$\mathcal{G}_T' = (\mathcal{V}_T', \mathcal{E}_T')$
+\emph{as follows.}
+
+\begin{enumerate}[label=(\roman*), leftmargin=*, itemsep=2pt]
+  \item A sibling node $v_i^{+}$ is introduced.
+        The attributes of $v_i$ are bisected and assigned equally to
+        both the original node and its sibling:
+        % Optimized for width
+        \begin{equation}
+          \begin{aligned}
+            c_i &\leftarrow \tfrac{c_i}{2}, &\quad
+            s_i &\leftarrow \tfrac{s_i}{2},\\
+            c_{i^{+}} &= \tfrac{c_i}{2}, &\quad
+            s_{i^{+}} &= \tfrac{s_i}{2}.
+          \end{aligned}
+          \label{eq:split_attr}
+        \end{equation}
+        A linear partition of $s_i$ is assumed for tractability;
+        any decomposition synchronisation overhead is implicitly
+        encapsulated within the updated CPU demand $c_i$.
+
+  \item The updated vertex set is
+        $\mathcal{V}_T' = \mathcal{V}_T \cup \{v_i^{+}\}$.
+
+  \item The sibling inherits the complete neighbourhood of $v_i$:
+        % Optimized for width
+        \begin{align}
+          \mathcal{E}_T' =\;& \mathcal{E}_T \nonumber\\
+          &\;\cup\; \bigl\{(v_p,\, v_i^{+}) : v_p \in \Pi(v_i)\bigr\}
+          \nonumber\\
+          &\;\cup\; \bigl\{(v_i^{+},\, v_s) : v_s \in \Sigma(v_i)\bigr\},
+          \label{eq:split_edges}
+        \end{align}
+        with the transfer volumes on rewired edges identical to those
+        on the corresponding edges of $v_i$.
+        \emph{No edge is inserted between $v_i$ and $v_i^{+}$},
+        so the two sub-tasks are topologically independent and may
+        execute concurrently on separate UAVs.
+\end{enumerate}
+
+The \textsc{Split} operation increases graph cardinality by one
+($|\mathcal{V}_T'| = |\mathcal{V}_T| + 1$) and halves the per-sub-task
+CPU demand, thereby exposing additional parallelism that is beneficial
+when the swarm contains under-utilised, high-capacity UAVs.
+
+\smallskip
+\noindent\textbf{Definition 2 (Merge).}
+\emph{Given two distinct nodes} $v_i, v_j \in \mathcal{V}_T$
+\emph{satisfying the acyclicity guard}
+\begin{equation}
+  \nexists\;\text{directed path}\;v_i \leadsto v_j
+  \;\;\text{and}\;\;
+  \nexists\;\text{directed path}\;v_j \leadsto v_i,
+  \label{eq:cycle_guard}
+\end{equation}
+\emph{the} \textsc{Merge}$(v_i, v_j)$
+\emph{operation produces}
+$\mathcal{G}_T' = (\mathcal{V}_T', \mathcal{E}_T')$
+\emph{as follows.}
+
+\begin{enumerate}[label=(\roman*), leftmargin=*, itemsep=2pt]
+  \item The attributes of $v_j$ are absorbed into $v_i$:
+        \begin{equation}
+          c_i \leftarrow c_i + c_j, \qquad
+          s_i \leftarrow s_i + s_j.
+          \label{eq:merge_attr}
+        \end{equation}
+
+  \item Let $\mathcal{E}_j = \{e \in \mathcal{E}_T : v_j \in e\}$.
+        Edges formerly incident to $v_j$ are redirected to $v_i$,
+        without creating duplicates or self-loops:
+        % Optimized for width
+        \begin{align}
+          \mathcal{E}_T' =\;& \bigl(\mathcal{E}_T \setminus \mathcal{E}_j\bigr)
+          \nonumber\\
+          &\;\cup\; \bigl\{(v_p,\, v_i) :
+            v_p \in \Pi(v_j),\; v_p \neq v_i,
+          \nonumber\\
+          &\qquad\qquad\quad (v_p, v_i) \notin \mathcal{E}_T\bigr\}
+          \nonumber\\
+          &\;\cup\; \bigl\{(v_i,\, v_s) :
+            v_s \in \Sigma(v_j),\; v_s \neq v_i,
+          \nonumber\\
+          &\qquad\qquad\quad (v_i, v_s) \notin \mathcal{E}_T\bigr\}.
+          \label{eq:merge_edges}
+        \end{align}
+
+  \item Node $v_j$ is removed:
+        $\mathcal{V}_T' = \mathcal{V}_T \setminus \{v_j\}$.
+\end{enumerate}
+
+The acyclicity guard \eqref{eq:cycle_guard} is both necessary and
+sufficient to guarantee that $\mathcal{G}_T'$ remains a valid DAG.
+The \textsc{Merge} operation decreases graph cardinality by one
+($|\mathcal{V}_T'| = |\mathcal{V}_T| - 1$) and, critically, eliminates
+the inter-UAV data transfer $d_{ij}$ that would otherwise be incurred
+on the link connecting the executors of $v_i$ and $v_j$.
+This elimination is particularly impactful when that link is
+bandwidth-constrained due to large inter-UAV separation, as
+characterised by the model in Section~\ref{subsec:mobility}.
+
+% ----------------------------------------------------------------
+\subsection{Heterogeneous UAV Swarm Model}
+\label{subsec:uav_model}
+
+\subsubsection*{UAV Fleet and Resource Graph}
+
+The UAV swarm is represented as a set of $M$ heterogeneous agents
+$\mathcal{U} = \{u_1, u_2, \ldots, u_M\}$.
+The swarm topology is captured by a \emph{resource graph}
+\begin{equation}
+  \mathcal{G}_R = \bigl(\mathcal{U},\; \mathcal{L}\bigr),
+  \label{eq:resource_graph}
+\end{equation}
+where $\mathcal{L} = \{(u_k, u_l) : k \neq l\}$ forms a fully
+connected edge set, reflecting the assumption that any pair of active
+UAVs may establish a communication link subject to the channel model
+in Section~\ref{subsec:mobility}.
+
+\subsubsection*{Static Hardware Profiles}
+
+Each UAV $u_k$ is characterised by a fixed hardware profile
+$\Gamma_k = (\phi_k,\, \beta_k^{(0)})$, where $\phi_k > 0$ is the
+\emph{nominal CPU capacity} (processing units under full battery) and
+$\beta_k^{(0)} \in (0, 1]$ is the \emph{initial battery level}
+(normalised fraction of total energy capacity).
+Heterogeneity is a defining characteristic of the fleet: UAVs
+differ across compute capability, wireless interface bandwidth, and
+initial energy reserves, reflecting the diversity of commercial
+multi-rotor platforms deployed in mobile edge-computing missions.
+
+\subsubsection*{Active UAV Set and Dynamic Resource State}
+
+At each epoch $t$, the subset of non-depleted UAVs is defined as
+\begin{equation}
+  \mathcal{U}_a(t) = \bigl\{u_k \in \mathcal{U} :
+    \beta_k(t) > 0 \bigr\},
+  \label{eq:active_set}
+\end{equation}
+with cardinality $M_a(t) = |\mathcal{U}_a(t)|$.
+Only members of $\mathcal{U}_a(t)$ participate in task execution and
+wireless communication; depleted UAVs are excluded from scheduling
+and contribute zero bandwidth to any link.
+
+The instantaneous state of the resource graph is encoded by a
+per-UAV feature matrix
+$\mathbf{X}^R(t) \in [0, 1]^{M \times 3}$,
+whose $k$-th row is the normalised feature vector
+\begin{equation}
+  \mathbf{x}_k^R(t) =
+  \Bigl[\,
+    \tilde{\phi}_k(t)/\phi^{\max},\;
+    \bar{B}_k(t)/B_{\max},\;
+    \beta_k(t)\,
+  \Bigr],
+  \label{eq:res_features}
+\end{equation}
+where $\tilde{\phi}_k(t)$ is the effective (battery-derated) CPU
+capacity defined in Section~\ref{subsec:latency_energy},
+$\phi^{\max} = \max_{k} \phi_k$ is the fleet-wide CPU ceiling, and
+$B_{\max}$ is the peak channel capacity.
+The mean link bandwidth from $u_k$ to all currently active peers is
+\begin{equation}
+  \bar{B}_k(t) =
+  \frac{1}{M_a(t) - 1}
+  \sum_{\substack{u_l \in \mathcal{U}_a(t) \\ l \neq k}} B_{kl}(t),
+  \label{eq:mean_bw}
+\end{equation}
+where $B_{kl}(t)$ is the pairwise link bandwidth defined in
+Section~\ref{subsec:mobility}, and the expression is defined to be
+zero when $M_a(t) = 1$.
+All three components of $\mathbf{x}_k^R(t)$ are normalised to
+$[0, 1]$, yielding a scale-invariant input for the graph neural
+network encoder and supporting stable policy gradient estimation.
+
+The resource graph $\mathcal{G}_R$ is thus \emph{dynamic}: as UAVs
+deplete their batteries, $M_a(t)$ contracts, reducing both the
+computational capacity available to the scheduler and the bandwidth
+available to inter-task communication.
+This degradation motivates the adaptive topology-shaping mechanism
+described in Section~\ref{subsec:task_shaping} and drives the
+design of the reinforcement learning agent in
+Section~\ref{sec:method}.
+
+% ----------------------------------------------------------------
+\subsection{Mobility and Communication Model}
+\label{subsec:mobility}
+
+The dynamic resource state of the swarm is fundamentally governed by
+UAV mobility: as UAVs move, inter-node distances change continuously,
+which in turn modulates the available link bandwidth and, therefore,
+the communication latency incurred during task execution.
+This non-stationarity is the primary motivation for adaptive topology
+shaping.
+
+\subsubsection*{Random Waypoint Mobility Model}
+
+UAV positions evolve in a bounded two-dimensional arena
+$\mathcal{A} = [0, L]^2$ according to the \emph{Random Waypoint}
+(RWP) model~\cite{rwp_model}.
+Each active UAV $u_k \in \mathcal{U}_a(t)$ moves at constant cruise
+speed $v_s$ toward a target waypoint $\mathbf{w}_k(t) \in \mathcal{A}$.
+At discrete step $t$ with time granularity $\Delta t$, the position
+is updated as
+\begin{equation}
+  \mathbf{p}_k(t+1) =
+  \begin{cases}
+    \mathbf{w}_k(t),
+      & \|\mathbf{w}_k(t) - \mathbf{p}_k(t)\|_2 \leq v_s \Delta t, \\[5pt]
+    \mathbf{p}_k(t)
+      + v_s \Delta t \cdot \hat{\mathbf{d}}_k(t),
+      & \text{otherwise,}
+  \end{cases}
+  \label{eq:rwp}
+\end{equation}
+where the unit direction vector is
+% Optimized for width
+\begin{equation*}
+  \hat{\mathbf{d}}_k(t) =
+  \frac{\mathbf{w}_k(t) - \mathbf{p}_k(t)}
+       {\|\mathbf{w}_k(t) - \mathbf{p}_k(t)\|_2}.
+\end{equation*}
+Upon reaching $\mathbf{w}_k(t)$, a new waypoint is sampled uniformly
+from $\mathcal{A}$.
+Depleted UAVs ($u_k \notin \mathcal{U}_a(t)$) remain stationary and
+contribute neither computation nor communication to the system.
+
+\subsubsection*{Distance-Dependent Bandwidth Decay}
+
+The achievable link bandwidth between two active UAVs $u_k$ and $u_l$
+at epoch $t$ is governed by a \emph{distance-dependent exponential
+decay} function.
+Let $r_{kl}(t) = \|\mathbf{p}_k(t) - \mathbf{p}_l(t)\|_2$ denote
+the Euclidean inter-UAV distance.
+The bandwidth is then
+% Optimized for width
+\begin{equation}
+  B_{kl}(t) =
+  \begin{cases}
+    B_{\min} + \bigl(B_{\max} - B_{\min}\bigr)\,
+      \exp\!\bigl(-r_{kl}(t)/\delta_H\bigr),
+    & r_{kl}(t) \leq D_c, \\[4pt]
+    B_{\min},
+    & r_{kl}(t) > D_c,
+  \end{cases}
+  \label{eq:bandwidth}
+\end{equation}
+where $B_{\max}$ is the peak link capacity achieved at zero
+separation, $B_{\min}$ is the floor bandwidth that persists beyond
+the maximum communication radius $D_c$, and $\delta_H$ is the
+\emph{characteristic decay distance} governing the rate of
+degradation with range.
+By convention, $B_{kk}(t) = 0$ for all $k$; and $B_{kl}(t) = 0$
+whenever $u_k \notin \mathcal{U}_a(t)$ or $u_l \notin
+\mathcal{U}_a(t)$.
+
+Three operating regimes emerge from \eqref{eq:bandwidth}:
+a \emph{near-field} regime ($r_{kl} \ll \delta_H$) where
+$B_{kl} \approx B_{\max}$;
+an \emph{intermediate} regime where bandwidth decays smoothly with
+the exponential kernel; and
+an \emph{out-of-range} regime ($r_{kl} > D_c$) where only the
+residual floor $B_{\min}$ remains available.
+Because $r_{kl}(t)$ varies continuously with swarm mobility, the
+bandwidth matrix $\mathbf{B}(t) \in \mathbb{R}_{\geq 0}^{M \times M}$
+is time-varying, making inter-task communication latency a
+non-stationary function of the swarm configuration.
+This establishes a direct coupling between UAV movement,
+link quality, and the DAG transformation decisions of the
+shaping agent, as formalised in the following subsection.
+
+% ----------------------------------------------------------------
+\subsection{Latency and Energy Consumption Model}
+\label{subsec:latency_energy}
+
+The time-varying bandwidth matrix $\mathbf{B}(t)$ introduced in
+Section~\ref{subsec:mobility} directly determines the communication
+cost of each inter-task data transfer.
+Combined with the energy dynamics that progressively reduce fleet
+capacity, these quantities constitute the reward-relevant signals
+that drive the topology-shaping policy.
+
+\subsubsection*{Deterministic Greedy Scheduler}
+
+Task-to-UAV assignment is performed by a \emph{mobility-aware greedy
+scheduler} that is a \emph{deterministic component of the environment},
+not a learned policy.
+At each epoch $t$, this scheduler processes tasks in topological
+order, assigning each task $v_j$ to the active UAV
+$u_l \in \mathcal{U}_a(t)$ with the greatest residual CPU budget.
+The reinforcement learning agent operates at a strictly higher level
+of abstraction: it observes the consequences of each scheduling round
+(encoded in the feedback vector $\mathbf{f}(t)$, defined below) and
+selects topology-shaping actions to influence future scheduling
+outcomes, without directly controlling individual task-to-UAV
+assignments.
+
+\subsubsection*{Task Execution Latency}
+
+The \emph{computation latency} of task $v_j$ assigned to $u_l$ is
+modelled as inversely proportional to the available processing
+capacity:
+\begin{equation}
+  L_j^{\mathrm{cmp}} = \kappa \cdot \frac{c_j}{\tilde{\phi}_l(t)},
+  \label{eq:latency_cmp}
+\end{equation}
+where $\kappa > 0$ is a hardware-dependent latency scaling coefficient
+(ms per unit of demand-to-capacity ratio) that captures processor and
+operating-system overheads.
+
+The \emph{communication latency} that must be resolved before $v_j$
+may begin is the aggregate of transfer times over all incoming edges:
+\begin{equation}
+  L_j^{\mathrm{com}}(t)
+  = \sum_{v_i \in \Pi(v_j)}
+    \frac{d_{ij}}{B_{\sigma(i)\,l}(t)},
+  \label{eq:latency_com}
+\end{equation}
+where $\sigma(i) \in [M]$ denotes the index of the UAV assigned to
+predecessor $v_i$ and $B_{\sigma(i)\,l}(t)$ is the instantaneous
+link bandwidth from that UAV to $u_l$ as given by
+\eqref{eq:bandwidth}.
+This formulation makes $L_j^{\mathrm{com}}(t)$ an explicit function
+of the current swarm configuration: tasks whose executors are
+separated by large distances incur high communication latency,
+providing a quantitative and direct incentive for the shaping agent
+to invoke \textsc{Merge} on such pairs.
+
+The \emph{finish time} of $v_j$ under the greedy schedule is
+\begin{equation}
+  f_j(t) = \max_{v_i \in \Pi(v_j)} f_i(t)
+            + L_j^{\mathrm{com}}(t)
+            + L_j^{\mathrm{cmp}},
+  \label{eq:finish_time}
+\end{equation}
+where $f_j(t) = 0$ for all source nodes ($\Pi(v_j) = \emptyset$).
+The \emph{schedule makespan} is
+\begin{equation}
+  T_{\mathrm{span}}(t) = \max_{v_j \in \mathcal{V}_T}\; f_j(t),
+  \label{eq:makespan}
+\end{equation}
+and a schedule is \emph{feasible} if and only if
+$T_{\mathrm{span}}(t) \leq T_D$, where $T_D$ is the system-level
+end-to-end latency deadline.
+
+\subsubsection*{Energy Depletion Model}
+
+Battery levels are tracked as normalised fractions
+$\beta_k(t) \in [0, 1]$ and are decremented after each scheduling
+round according to a linear additive cost model.
+The per-round battery depletion of $u_k$ is
+\begin{equation}
+  \Delta\beta_k(t) =
+    \alpha_c\,\rho_k(t) + \alpha_t\,\tau_k(t),
+  \label{eq:energy_depletion}
+\end{equation}
+where $\rho_k(t) \geq 0$ (CPU units) and $\tau_k(t) \geq 0$ (MB)
+denote the total computation load and data volume transmitted by
+$u_k$ in round $t$, respectively.
+The coefficient $\alpha_c > 0$ is the energy rate per consumed CPU
+unit and $\alpha_t > 0$ is the energy rate per transmitted megabyte.
+The battery state is then updated as
+\begin{equation}
+  \beta_k(t+1) = \max\!\bigl(\beta_k(t) - \Delta\beta_k(t),\; 0\bigr).
+  \label{eq:battery_update}
+\end{equation}
+
+\subsubsection*{Battery-Aware CPU Derating}
+
+To model the reduced computing capability of energy-constrained UAVs,
+the effective CPU capacity of $u_k$ is defined as a piecewise function
+of its residual battery:
+\begin{equation}
+  \tilde{\phi}_k(t) =
+  \begin{cases}
+    0,
+      & \beta_k(t) = 0
+        \quad\text{(depleted — offline)}, \\[4pt]
+    \gamma\,\phi_k,
+      & 0 < \beta_k(t) < \beta_{\mathrm{low}}
+        \quad\text{(low-power mode)}, \\[4pt]
+    \phi_k,
+      & \beta_k(t) \geq \beta_{\mathrm{low}}
+        \quad\text{(nominal operation)},
+  \end{cases}
+  \label{eq:cpu_derating}
+\end{equation}
+where $\beta_{\mathrm{low}} \in (0, 1)$ is the low-battery threshold
+and $\gamma \in (0, 1)$ is the CPU derating factor applied in
+low-power mode.
+UAVs satisfying $\beta_k(t) = 0$ are removed from the active pool
+$\mathcal{U}_a(t)$: they are excluded from both task assignment and
+link formation in $\mathbf{B}(t)$.
+This battery-induced shrinkage of $M_a(t)$ creates a positive
+feedback loop: fewer active UAVs reduce the schedulable CPU budget,
+which increases per-task execution latency \eqref{eq:latency_cmp}
+and may force reschedule events—all of which are captured in the
+feedback signal defined below.
+
+\subsubsection*{Scheduling Feedback Signal}
+
+At each epoch $t$, the outcome of the scheduling round is summarised
+by the six-dimensional feedback vector
+% Optimized for width
+\begin{equation}
+  \begin{split}
+    \mathbf{f}(t) = \bigl[\,
+      \lambda(t),\; \sigma(t),\; \varrho(t),\\
+      \bar{u}(t),\; \hat{B}_{\min}(t),\; \hat{\beta}_{\min}(t)\,
+    \bigr]^{\!\top} \in \mathbb{R}^6,
+  \end{split}
+  \label{eq:feedback}
+\end{equation}
+whose components are defined as follows.
+$\lambda(t) = T_{\mathrm{span}}(t)/T_D \in \mathbb{R}_{\geq 0}$ is
+the \emph{normalised makespan} (latency ratio), with $\lambda > 1$
+indicating a deadline miss.
+$\sigma(t) \in [0, 1]$ is the \emph{task success rate}, i.e., the
+fraction of tasks in $\mathcal{V}_T$ for which a feasible assignment
+was found in $\mathcal{U}_a(t)$.
+$\varrho(t) \in \mathbb{Z}_{\geq 0}$ is the \emph{reschedule count},
+i.e., the number of tasks that required a forced assignment to an
+overloaded UAV due to insufficient residual CPU.
+$\bar{u}(t) \in [0, 1]$ is the \emph{mean fleet CPU utilisation}
+across active UAVs.
+$\hat{B}_{\min}(t) \in [0, 1]$ is the \emph{normalised minimum link
+bandwidth}, defined as
+$\min_{u_k, u_l \in \mathcal{U}_a,\, k \neq l} B_{kl}(t) / B_{\max}$,
+which serves as an indicator of link fragmentation induced by mobility.
+$\hat{\beta}_{\min}(t) \in [0, 1]$ is the \emph{minimum battery
+fraction} across the entire swarm,
+$\min_{u_k \in \mathcal{U}} \beta_k(t)$, signalling impending UAV
+depletion.
+
+The vector $\mathbf{f}(t)$ is concatenated with the GNN-encoded
+state of $(\mathcal{G}_T, \mathcal{G}_R)$ to form the complete
+observation fed to the RL agent at each epoch.
+The coupling among $\mathbf{f}(t)$, $\mathbf{B}(t)$, and the shaped
+graph $\mathcal{G}_T'$ constitutes the core closed-loop signal of the
+proposed framework: each topology decision modifies the workload
+structure, which in turn alters the scheduling outcome and hence
+$\mathbf{f}(t+1)$, enabling the agent to learn multi-step adaptive
+strategies as detailed in Section~\ref{sec:method}.

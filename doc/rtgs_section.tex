@@ -1,0 +1,680 @@
+% ============================================================
+%  Section: RTGS — Resource-Aware Task Graph Shaping
+%  IEEE Transactions style  |  English  |  third-person passive
+%
+%  Required preamble packages:
+%    \usepackage{amsmath, amssymb, bm}
+%    \usepackage{algorithm, algpseudocode}
+%    \usepackage{enumitem}
+%
+%  Notation (consistent with system_description.tex):
+%    \mathcal{G}_T = (\mathcal{V}_T, \mathcal{E}_T)  — Task DAG
+%    \mathcal{G}_R = (\mathcal{U}, \mathcal{L})       — Resource graph
+%    v_i  — task node  |  u_k  — UAV  |  t  — decision epoch
+%    M    — number of UAVs  |  N_t — current task-graph cardinality
+%    N_{\max} = 20          — padded node budget
+%    \tilde{\phi}_k(t)      — battery-derated CPU of u_k at epoch t
+%    B_{kl}(t)              — link bandwidth between u_k and u_l
+%    \beta_k(t)             — battery fraction of u_k
+% ============================================================
+
+% ----------------------------------------------------------------
+\section{RTGS: Resource-Aware Task Graph Shaping}
+\label{sec:method}
+
+% ----------------------------------------------------------------
+\subsection{Framework Overview}
+\label{subsec:overview}
+
+Conventional UAV task-offloading methods treat the task DAG
+$\mathcal{G}_T$ as a fixed input and optimise only the mapping
+of tasks to UAVs.
+This assumption is untenable in practice: heterogeneous UAV swarms
+exhibit time-varying bandwidth, progressive battery depletion, and
+spatial mobility, all of which continuously alter the cost of
+executing and communicating between tasks.
+A graph topology that is efficient at one epoch may become a
+scheduling bottleneck moments later as link quality degrades or a UAV
+loses computing capacity.
+
+The proposed framework, \emph{Resource-Aware Task Graph Shaping}
+(RTGS), reframes the problem by treating the task graph topology
+itself as a \emph{control variable}.
+At each decision epoch $t$, an RL agent observes the joint state of
+the task workload and the physical resource layer, then selects a
+structural transformation of $\mathcal{G}_T$ before scheduling takes
+place.
+The modified graph is handed to a deterministic, mobility-aware
+greedy scheduler that translates the current topology into a concrete
+task-to-UAV assignment.
+The scheduling outcome and the evolving swarm state jointly generate
+a feedback signal that closes the adaptive loop.
+
+Three design principles distinguish RTGS from prior work.
+\textbf{(i) Dynamic topology control}: the agent may expand
+task parallelism via node splitting or consolidate workloads via node
+merging, rather than being constrained to schedule a fixed graph.
+\textbf{(ii) Resource-aware node selection}: a cross-graph attention
+mechanism embeds each task node in the context of the current UAV
+resource state, so that split and merge decisions are conditioned on
+which physical nodes would execute the affected tasks and what links
+connect them.
+\textbf{(iii) Structurally valid node-level actions}: the action
+space operates at the granularity of individual task nodes and
+node pairs, with an action mask that enforces DAG acyclicity,
+capacity feasibility, and graph-size bounds at every step.
+
+The overall architecture is illustrated in Fig.~\ref{fig:framework}.
+
+% ----------------------------------------------------------------
+\subsection{Problem Formulation}
+\label{subsec:mdp}
+
+\subsubsection*{MDP Structure}
+
+The RTGS control problem is formalised as a Markov Decision Process
+$\langle \mathcal{S},\, \mathcal{A},\, \mathcal{R},\, \gamma \rangle$
+where each component is defined to capture the dual dynamics of the
+task graph and the physical UAV swarm.
+
+\subsubsection*{State Space}
+
+A state $s_t \in \mathcal{S}$ is a composite observation that encodes
+three information sources:
+\begin{equation}
+  s_t = \bigl(
+    \mathbf{X}^T_t,\; \mathbf{E}^T_t,\;
+    \mathbf{X}^R_t,\; \mathbf{E}^R,\;
+    \mathbf{f}_t
+  \bigr),
+  \label{eq:state}
+\end{equation}
+where the components are defined as follows.
+
+\textit{Task-graph observation.}
+$\mathbf{X}^T_t \in \mathbb{R}^{N_{\max} \times 2}$ is a
+zero-padded node-feature matrix whose $i$-th row is the attribute
+pair $\mathbf{x}_i^T = (c_i,\, s_i)$ of task $v_i$ (CPU demand and
+data volume, respectively); $\mathbf{E}^T_t \in
+\mathbb{Z}^{2 \times N_{\max}^2}$ is the corresponding COO-format
+edge index.
+Rows beyond the current graph size $N_t \leq N_{\max}$ are padded
+with zeros and are excluded from all computations by structural
+masking.
+
+\textit{Resource-graph observation.}
+$\mathbf{X}^R_t \in [0,1]^{M \times 3}$ is a dynamic node-feature
+matrix whose $k$-th row captures the instantaneous state of UAV $u_k$:
+\begin{equation}
+  \mathbf{x}_k^R(t) =
+  \Bigl[\,
+    \tilde{\phi}_k(t)/\phi^{\max},\quad
+    \bar{B}_k(t)/B_{\max},\quad
+    \beta_k(t)
+  \,\Bigr]^\top,
+  \label{eq:res_feat}
+\end{equation}
+representing the battery-derated CPU ratio,
+mean link-bandwidth ratio to active peers,
+and residual battery fraction, respectively.
+$\mathbf{E}^R$ is the edge index of the fully-connected resource
+graph, fixed for a given fleet size $M$.
+
+\textit{Scheduling feedback.}
+$\mathbf{f}_t \in \mathbb{R}^6$ summarises the outcome of the
+most recent scheduling round:
+\begin{equation}
+  \mathbf{f}_t = \bigl[
+    \lambda_t,\;\sigma_t,\;\varrho_t,\;
+    \bar{u}_t,\;\hat{B}_{\min,t},\;\hat{\beta}_{\min,t}
+  \bigr]^\top,
+  \label{eq:feedback}
+\end{equation}
+where $\lambda_t = T_{\mathrm{span}}(t)/T_D$ is the normalised
+makespan, $\sigma_t$ is the task-success rate, $\varrho_t$ is the
+number of forced reschedule events, $\bar{u}_t$ is the mean fleet
+CPU utilisation, $\hat{B}_{\min,t}$ is the normalised minimum active
+link bandwidth, and $\hat{\beta}_{\min,t}$ is the minimum battery
+fraction across all UAVs.
+Together, these six signals equip the agent with a compressed
+view of both the scheduling quality and the current physical
+bottleneck of the swarm.
+
+\subsubsection*{Action Space}
+
+The action space is a flat discrete set of
+\emph{node-level graph-shaping operations}:
+\begin{equation}
+  \mathcal{A} = \mathcal{A}_{\mathrm{noop}}
+              \;\cup\; \mathcal{A}_{\mathrm{split}}
+              \;\cup\; \mathcal{A}_{\mathrm{merge}},
+  \label{eq:action_space}
+\end{equation}
+with cardinalities
+$|\mathcal{A}_{\mathrm{noop}}| = 1$,\,
+$|\mathcal{A}_{\mathrm{split}}| = N_{\max}$, and
+$|\mathcal{A}_{\mathrm{merge}}| = \binom{N_{\max}}{2}$,
+giving $|\mathcal{A}| = 1 + 20 + 190 = 211$ for $N_{\max} = 20$.
+Each action is decoded to a triple
+$(op,\, i,\, j) \in
+ \{\mathrm{noop},\mathrm{split},\mathrm{merge}\}
+ \times [N_{\max}] \times [N_{\max}]$,
+where $i$ and $j$ index nodes in the padded ordering.
+Operating at the node level, rather than selecting a global operation
+heuristically, allows the policy to learn \emph{which specific task}
+to restructure based on the current resource context—a capability
+absent from prior graph-shaping approaches.
+
+\subsubsection*{Reward Function}
+
+The reward $r_t$ is a composite signal designed to credit
+absolute scheduling quality, incremental improvement, and
+penalise structural pathologies:
+\begin{equation}
+  r_t = r_t^{\mathrm{qual}}
+      + r_t^{\Delta}
+      + r_t^{\mathrm{pen}},
+  \label{eq:reward}
+\end{equation}
+with each component defined as follows.
+
+The \textit{absolute-quality term} rewards the agent for achieving
+high success rates and feasible latencies, irrespective of prior
+performance:
+\begin{equation}
+  r_t^{\mathrm{qual}} =
+    2\,\sigma_t + 1.5\,\max\!\bigl(0,\,1-\lambda_t\bigr).
+  \label{eq:r_qual}
+\end{equation}
+
+The \textit{improvement term} provides dense shaping by rewarding
+reductions in normalised latency and increases in success rate
+relative to the preceding epoch:
+\begin{equation}
+  r_t^{\Delta} =
+    (\lambda_{t-1} - \lambda_t)
+    + 0.5\,(\sigma_t - \sigma_{t-1}).
+  \label{eq:r_delta}
+\end{equation}
+
+The \textit{penalty term} discourages forced reschedules,
+deadline violations, and unbounded graph inflation:
+\begin{equation}
+  r_t^{\mathrm{pen}} =
+    -\,\frac{\varrho_t}{N_t}
+    - 2\,\max\!\bigl(0,\,\lambda_t - 1\bigr)
+    - 0.05\,\max\!\bigl(0,\,N_t - (N_{\max}-2)\bigr).
+  \label{eq:r_pen}
+\end{equation}
+The reschedule penalty is normalised by the current graph size $N_t$
+to eliminate the bias whereby larger graphs accumulate higher absolute
+reschedule counts by construction.
+The latency overshoot penalty is smooth rather than clipped,
+preserving gradient signal beyond the deadline boundary.
+The inflation penalty activates only when $N_t > 18$, preserving
+headroom for productive splitting while preventing degenerate
+graph growth.
+
+% ----------------------------------------------------------------
+\subsection{Dual-Graph State Representation}
+\label{subsec:gnn}
+
+A dedicated GNN encoder extracts structured representations from
+each graph independently before the two streams are fused.
+
+\subsubsection*{Node-Level GraphSAGE Encoding}
+
+Both graphs are processed by an instance of the same
+\textit{node-level} GNN architecture, which differs from standard
+graph classification networks by omitting the global pooling step
+and returning a per-node embedding matrix.
+Concretely, for a graph with node features $\mathbf{X}$ and edge
+index $\mathbf{E}$, the encoder applies $L$ GraphSAGE
+layers~\cite{hamilton2017inductive} followed by a linear projection:
+\begin{equation}
+  \mathbf{h}_i^{(\ell)} = \sigma\!\Bigl(
+    \mathbf{W}^{(\ell)} \cdot \mathrm{CONCAT}\Bigl[
+      \mathbf{h}_i^{(\ell-1)},\;
+      \mathrm{MEAN}_{j \in \mathcal{N}(i)}\!\bigl[
+        \mathbf{h}_j^{(\ell-1)}
+      \bigr]
+    \Bigr]
+  \Bigr),
+  \label{eq:sage}
+\end{equation}
+where $\mathcal{N}(i)$ is the neighbourhood of node $i$
+and $\sigma$ denotes LayerNorm followed by ReLU.
+For the task graph and resource graph respectively:
+\begin{align}
+  \mathbf{H}^T &= \textsc{Enc}_\tau\!\bigl(
+                   \mathbf{X}^T_t,\,\mathbf{E}^T_t
+                 \bigr) \in \mathbb{R}^{N_{\max} \times d},
+  \label{eq:enc_task}\\
+  \mathbf{H}^R &= \textsc{Enc}_r\!\bigl(
+                   \mathbf{X}^R_t,\,\mathbf{E}^R
+                 \bigr) \in \mathbb{R}^{M \times d},
+  \label{eq:enc_res}
+\end{align}
+with embedding dimension $d = 32$, hidden width $d_h = 64$,
+and $L = 2$ message-passing layers.
+Padding rows in $\mathbf{H}^T$ are zeroed out after encoding via a
+boolean mask derived from $\mathbf{X}^T_t$, preventing spurious
+gradient flow through phantom nodes.
+
+% ----------------------------------------------------------------
+\subsection{Cross-Graph Attention Mechanism}
+\label{subsec:attention}
+
+The central architectural innovation of RTGS is a
+\emph{cross-graph attention} module that enriches each task node
+embedding with contextual information drawn from the current UAV
+resource state.
+This coupling enables the policy to condition split and merge
+decisions on \emph{which physical resources would be responsible for
+executing the affected tasks}, a form of lookahead that is
+inaccessible to policies that process the two graphs independently.
+
+\subsubsection*{Task-to-Resource Attention}
+
+Given the encoded representations $\mathbf{H}^T$ and $\mathbf{H}^R$,
+single-head scaled dot-product attention is applied with task nodes
+as queries and resource nodes as keys and values:
+\begin{align}
+  \mathbf{Q} &= \mathbf{H}^T \mathbf{W}_Q,\quad
+  \mathbf{K}  = \mathbf{H}^R \mathbf{W}_K,\quad
+  \mathbf{V}  = \mathbf{H}^R \mathbf{W}_V,
+  \label{eq:qkv}\\[4pt]
+  \boldsymbol{\Alpha} &=
+    \mathrm{softmax}\!\left(
+      \frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d}}
+    \right) \in [0,1]^{N_{\max} \times M},
+  \label{eq:attn}\\[4pt]
+  \tilde{\mathbf{H}}^T &=
+    \mathbf{H}^T + \mathbf{W}_O \bigl(\boldsymbol{\Alpha}\mathbf{V}\bigr),
+  \label{eq:enriched}
+\end{align}
+where $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V, \mathbf{W}_O
+\in \mathbb{R}^{d \times d}$ are learnable projection matrices
+and the outer sum in \eqref{eq:enriched} is a residual connection.
+
+The entry $\Alpha_{ik} \in [0,1]$ can be interpreted as the
+\emph{soft assignment weight} of task $v_i$ to UAV $u_k$:
+a high value indicates that the current resource embedding of $u_k$
+is most compatible with executing $v_i$.
+These weights are not discarded after computing $\tilde{\mathbf{H}}^T$;
+they are propagated to the merge scoring head as an inter-node
+link-quality signal (see Section~\ref{subsec:actor}).
+
+\subsubsection*{Global State Vector}
+
+A global state vector $\mathbf{g} \in \mathbb{R}^{d_g}$
+is assembled for use by the value function and the noop scoring head:
+\begin{equation}
+  \mathbf{g} = \Bigl[
+    \bar{\mathbf{h}}^T_{\mathrm{real}}\;\Big\|\;
+    \bar{\mathbf{h}}^R\;\Big\|\;
+    \mathbf{b}_{\mathrm{res}}\;\Big\|\;
+    \mathbf{f}_t
+  \Bigr],
+  \label{eq:global}
+\end{equation}
+where $\bar{\mathbf{h}}^T_{\mathrm{real}}$ is the masked mean of
+$\tilde{\mathbf{H}}^T$ over real (non-padding) task nodes,
+$\bar{\mathbf{h}}^R$ is the mean of $\mathbf{H}^R$ over all UAVs,
+and $\mathbf{b}_{\mathrm{res}} \in \mathbb{R}^6$ is a
+\textit{resource bottleneck descriptor}:
+\begin{equation}
+  \mathbf{b}_{\mathrm{res}} =
+  \Bigl[
+    \min_{k}\,\mathbf{x}_k^R(t)\;\Big\|\;
+    \tfrac{1}{M}\sum_k \mathbf{x}_k^R(t)
+  \Bigr],
+  \label{eq:bottleneck}
+\end{equation}
+concatenating the per-feature fleet minimum and fleet mean across
+all $M$ UAVs.
+The minimum captures the identity of the most depleted or
+most congested node in the fleet—information that is lost under
+plain mean aggregation—so that the value function remains
+sensitive to impending resource failures.
+With $d = 32$, $M = 8$, and a six-dimensional feedback vector,
+the global state has dimension
+$d_g = d + d + 6 + 6 = 76$.
+
+% ----------------------------------------------------------------
+\subsection{Node-Level Actor-Critic}
+\label{subsec:actor}
+
+\subsubsection*{Three-Head Action Logit Architecture}
+
+The policy network produces action logits through three
+semantically distinct scoring heads, each operating at a
+different level of granularity.
+
+\noindent\textbf{Noop head.}
+A linear map over the global state $\mathbf{g}$ produces a single
+scalar logit representing the value of leaving the graph unchanged:
+\begin{equation}
+  z_{\mathrm{noop}} = \mathbf{w}_{\mathrm{no}}^\top \mathbf{g}
+    \in \mathbb{R}.
+  \label{eq:z_noop}
+\end{equation}
+
+\noindent\textbf{Split head.}
+A shared linear scoring function is applied independently to each
+resource-enriched task node embedding, yielding one logit per
+padded node position:
+\begin{equation}
+  \mathbf{z}_{\mathrm{split}} =
+    \tilde{\mathbf{H}}^T\,\mathbf{w}_{\mathrm{sp}}
+    \in \mathbb{R}^{N_{\max}}.
+  \label{eq:z_split}
+\end{equation}
+Because $\tilde{\mathbf{H}}^T$ already encodes the soft assignment
+of each task to a UAV, the split head learns to prefer nodes whose
+assigned UAV has high residual CPU capacity—a form of
+\emph{resource-opportunistic decomposition}.
+
+\noindent\textbf{Merge head with link-quality signal.}
+For each ordered pair $(v_i, v_j)$ in the enumeration of all
+$\binom{N_{\max}}{2} = 190$ candidate node pairs, a
+\textit{link-quality scalar} $q_{ij}$ is computed from the
+cross-graph attention weights:
+\begin{equation}
+  q_{ij} = \boldsymbol{\Alpha}_i \cdot \boldsymbol{\Alpha}_j
+          = \sum_{k=1}^{M} \Alpha_{ik}\,\Alpha_{jk},
+  \label{eq:link_quality}
+\end{equation}
+where $\boldsymbol{\Alpha}_i \in \mathbb{R}^M$ is the $i$-th row of
+the attention matrix.
+A high value of $q_{ij}$ indicates that both tasks attend strongly to
+the \emph{same} UAV, implying that executing them on the same node
+would incur negligible transfer cost—and that merging them
+provides limited scheduling benefit.
+Conversely, a low $q_{ij}$ signals that the two tasks are likely
+assigned to \emph{different} UAVs connected by a potentially weak
+link; merging eliminates that cross-UAV transfer entirely and
+is therefore highly advantageous.
+The merge logit is computed by a two-layer MLP that jointly
+processes both node embeddings and the link-quality signal:
+\begin{equation}
+  z_{ij}^{\mathrm{merge}} =
+    \mathrm{MLP}_{\mathrm{me}}\!\Bigl(
+      \bigl[\,
+        \tilde{\mathbf{h}}_i \;\|\;
+        \tilde{\mathbf{h}}_j \;\|\;
+        q_{ij}
+      \,\bigr]
+    \Bigr) \in \mathbb{R},
+  \label{eq:z_merge}
+\end{equation}
+with input dimension $2d + 1 = 65$.
+
+All three logit vectors are concatenated into the full action score:
+\begin{equation}
+  \mathbf{z} = \bigl[
+    z_{\mathrm{noop}}\;\|\;
+    \mathbf{z}_{\mathrm{split}}\;\|\;
+    \mathbf{z}_{\mathrm{merge}}
+  \bigr] \in \mathbb{R}^{211}.
+  \label{eq:logits}
+\end{equation}
+The value estimate is obtained from a separate linear head over
+the global state:
+\begin{equation}
+  V(s_t) = \mathbf{w}_V^\top \mathbf{g} \in \mathbb{R}.
+  \label{eq:value}
+\end{equation}
+
+\subsubsection*{Structural Action Masking}
+\label{subsubsec:masking}
+
+A key property of RTGS is that the action distribution is restricted
+to \emph{structurally valid} operations at every step by applying a
+Boolean mask $\mathbf{m}_t \in \{0,1\}^{211}$ before sampling.
+The mask is computed from the current observation without gradient
+and enforces three validity conditions:
+
+\begin{enumerate}[label=(\roman*), leftmargin=*, itemsep=2pt]
+  \item \textbf{Noop} is always valid:
+        $m_0 = 1$.
+  \item \textbf{Split}$(v_i)$ is valid iff $v_i$ is a real
+        (non-padding) node, the graph has not reached its maximum
+        cardinality ($N_t < N_{\max}$), and at least one UAV
+        retains positive effective CPU capacity
+        ($\max_k \tilde{\phi}_k(t) > 0$):
+        \begin{equation}
+          m_i^{\mathrm{sp}} =
+            \mathbb{1}[v_i\text{ real}] \cdot
+            \mathbb{1}[N_t < N_{\max}] \cdot
+            \mathbb{1}\!\bigl[\max_k \tilde{\phi}_k(t) > 0\bigr].
+          \label{eq:mask_split}
+        \end{equation}
+  \item \textbf{Merge}$(v_i, v_j)$ is valid iff both nodes
+        are real and are \emph{leaf} nodes in the current DAG
+        (out-degree zero):
+        \begin{equation}
+          m_{ij}^{\mathrm{me}} =
+            \mathbb{1}[v_i\text{ real leaf}] \cdot
+            \mathbb{1}[v_j\text{ real leaf}].
+          \label{eq:mask_merge}
+        \end{equation}
+\end{enumerate}
+
+Condition (iii) guarantees DAG acyclicity: if both $v_i$ and $v_j$
+are leaves, no directed path exists between them, so their merger
+cannot introduce a cycle.
+The masked Categorical distribution is formed as:
+\begin{equation}
+  \pi_\theta(a \mid s_t) =
+    \frac{\exp(z_a + \log m_{t,a})}
+         {\sum_{a'} \exp(z_{a'} + \log m_{t,a'})},
+  \label{eq:masked_policy}
+\end{equation}
+where $\log 0 \triangleq -\infty$, so that invalid actions
+receive zero probability.
+The mask is reapplied identically during PPO updates to maintain
+consistency between rollout-collection and gradient-computation
+log-probabilities.
+
+% ----------------------------------------------------------------
+\subsection{Graph Shaping Operators}
+\label{subsec:operators}
+
+Two graph-transformation primitives are executed by the environment
+in response to the agent's action.
+Both operators produce a mutated copy of $\mathcal{G}_T$ without
+modifying the original, so that any roll-back or comparison is
+well-defined.
+
+\subsubsection*{Split Operator}
+
+\textsc{Split}$(v_i)$ decomposes a targeted task node into
+two parallel sub-tasks.
+Formally, given $|\mathcal{V}_T| < N_{\max}$, a sibling node
+$v_i^{+}$ is introduced with
+\begin{equation}
+  c_{i^{+}} = c_i/2,\qquad s_{i^{+}} = s_i/2,
+  \label{eq:split_attr}
+\end{equation}
+and the attributes of $v_i$ are simultaneously halved.
+The sibling inherits the complete in-neighbourhood and
+out-neighbourhood of $v_i$, while no edge is inserted between
+$v_i$ and $v_i^{+}$:
+\begin{equation}
+  \mathcal{E}_T' = \mathcal{E}_T
+    \cup \bigl\{(v_p,\, v_i^{+}) : v_p \in \Pi(v_i)\bigr\}
+    \cup \bigl\{(v_i^{+},\, v_s) : v_s \in \Sigma(v_i)\bigr\}.
+  \label{eq:split_edges}
+\end{equation}
+The absence of a sibling edge is intentional:
+$v_i$ and $v_i^{+}$ are topologically independent and may therefore
+execute concurrently on separate UAVs,
+halving the effective CPU bottleneck of the original task and
+exposing additional inter-UAV parallelism.
+
+\subsubsection*{Merge Operator}
+
+\textsc{Merge}$(v_i, v_j)$ collapses two tasks into a single node.
+The acyclicity guard
+\begin{equation}
+  \nexists\;\text{directed path}\;v_i \leadsto v_j
+  \;\;\text{and}\;\;
+  \nexists\;\text{directed path}\;v_j \leadsto v_i
+  \label{eq:cycle_guard}
+\end{equation}
+is verified before the operation; otherwise the action is silently
+voided.
+When the guard holds, the attributes of $v_j$ are absorbed into
+$v_i$:
+\begin{equation}
+  c_i \leftarrow c_i + c_j,\qquad s_i \leftarrow s_i + s_j.
+  \label{eq:merge_attr}
+\end{equation}
+All edges formerly incident to $v_j$ are redirected to $v_i$
+without duplicating existing edges or introducing self-loops;
+$v_j$ is then removed.
+The critical scheduling benefit is the elimination of the
+inter-UAV data transfer $d_{ij}$ that would have been incurred on
+the link connecting the respective executors of $v_i$ and $v_j$—a
+saving that is particularly significant when that link suffers from
+mobility-induced bandwidth degradation.
+
+% ----------------------------------------------------------------
+\subsection{PPO-Based Policy Optimisation}
+\label{subsec:ppo}
+
+The policy $\pi_\theta$ is trained with Proximal Policy
+Optimisation (PPO)~\cite{schulman2017proximal} using a rollout
+buffer of $T_r = 2048$ transitions collected from a single
+environment instance.
+The compound loss is
+\begin{equation}
+  \mathcal{L}(\theta) =
+    \mathcal{L}_{\mathrm{clip}}(\theta)
+    + c_v \mathcal{L}_{\mathrm{vf}}(\theta)
+    - c_H \mathcal{H}(\pi_\theta),
+  \label{eq:ppo_loss}
+\end{equation}
+where the clipped policy gradient objective is
+\begin{equation}
+  \mathcal{L}_{\mathrm{clip}}(\theta) =
+    -\mathbb{E}_t\!\left[
+      \min\!\Bigl(
+        \rho_t \hat{A}_t,\;
+        \mathrm{clip}\bigl(\rho_t,\,1\!-\!\epsilon,\,1\!+\!\epsilon\bigr)\hat{A}_t
+      \Bigr)
+    \right],
+  \label{eq:ppo_clip}
+\end{equation}
+with likelihood ratio
+$\rho_t = \pi_\theta(a_t \mid s_t)\,/\,\pi_{\theta_{\mathrm{old}}}(a_t \mid s_t)$
+and clip coefficient $\epsilon = 0.2$.
+The value loss and entropy regulariser are
+\begin{align}
+  \mathcal{L}_{\mathrm{vf}}(\theta)
+    &= \mathbb{E}_t\!\bigl[\bigl(V_\theta(s_t) - R_t\bigr)^2\bigr],
+  \label{eq:vf_loss}\\
+  \mathcal{H}(\pi_\theta)
+    &= -\mathbb{E}_t\!\bigl[
+        \sum_a \pi_\theta(a \mid s_t)\log\pi_\theta(a \mid s_t)
+      \bigr],
+  \label{eq:entropy}
+\end{align}
+with discount-return $R_t = \sum_{l \geq 0} \gamma^l r_{t+l}$,
+$\gamma = 0.99$, and coefficients $c_v = 0.5$, $c_H = 0.05$.
+The entropy coefficient is set higher than typical PPO defaults to
+counteract the tendency of the policy to prematurely collapse onto
+the noop action in the large 211-dimensional action space.
+The advantage estimates $\hat{A}_t = R_t - V_\theta(s_t)$ are
+standardised to zero mean and unit variance per rollout.
+Parameters are updated for $K = 4$ epochs per rollout with
+mini-batches of size 128; gradients are clipped to $\ell_2$
+norm~$0.5$.
+
+The full training procedure is summarised in
+Algorithm~\ref{alg:rtgs}.
+
+% ----- Algorithm block -----------------------------------------
+\begin{algorithm}[t]
+\caption{RTGS Training with PPO}
+\label{alg:rtgs}
+\begin{algorithmic}[1]
+\Require Environment $\mathcal{E}$, policy network $\pi_\theta$
+         with parameters $\theta$,\;
+         rollout length $T_r$,\;
+         PPO epochs $K$,\;
+         mini-batch size $B_{\mathrm{mb}}$
+\State Initialise $\theta$ randomly; reset $\mathcal{E}$; receive $s_1$
+
+\While{total steps $< 2{\times}10^6$}
+
+  \State \textbf{// --- Phase 1: Rollout collection ---}
+  \State Clear rollout buffer $\mathcal{B}$
+  \For{$t = 1, \ldots, T_r$}
+
+    \State Encode observation:
+           $\mathbf{H}^T, \mathbf{H}^R \leftarrow
+            \textsc{Enc}_\tau(s_t),\,\textsc{Enc}_r(s_t)$
+    \State Compute cross-attention:
+           $\tilde{\mathbf{H}}^T,\, \boldsymbol{\Alpha}
+            \leftarrow \textsc{CrossAttn}(\mathbf{H}^T, \mathbf{H}^R)$
+    \State Build global state $\mathbf{g}$ via \eqref{eq:global}
+    \State Compute logits $\mathbf{z}$ via \eqref{eq:logits}
+           and value $V(s_t)$ via \eqref{eq:value}
+    \State Compute action mask $\mathbf{m}_t$ via
+           \eqref{eq:mask_split}--\eqref{eq:mask_merge}
+    \State Sample $a_t \sim \mathrm{Categorical}(
+           \mathrm{softmax}(\mathbf{z} + \log\mathbf{m}_t))$
+    \State Decode $a_t \rightarrow (op,\, v_i,\, v_j)$
+    \State Execute in $\mathcal{E}$:
+           $s_{t+1},\, r_t,\, \mathrm{done}_t
+            \leftarrow \mathcal{E}.\textsc{Step}(a_t)$
+           \Comment{shaping $\rightarrow$ scheduling $\rightarrow$ mobility}
+    \State Store $(s_t, a_t, \log\pi_\theta(a_t|s_t),
+                  r_t, V(s_t), \mathrm{done}_t)$ in $\mathcal{B}$
+
+  \EndFor
+
+  \State \textbf{// --- Phase 2: Return and advantage estimation ---}
+  \State $R_{T_r+1} \leftarrow V_\theta(s_{T_r+1})$
+         (bootstrap from last state)
+  \State Compute discounted returns $R_t$ and standardised advantages
+         $\hat{A}_t$ for all $t$
+
+  \State \textbf{// --- Phase 3: Policy update ---}
+  \State Snapshot old policy: $\theta_{\mathrm{old}} \leftarrow \theta$
+  \For{epoch $= 1, \ldots, K$}
+    \For{each mini-batch $\mathcal{M} \subseteq \mathcal{B}$
+         of size $B_{\mathrm{mb}}$}
+      \State Recompute $\mathbf{z}, V_\theta(s_t)$ with current $\theta$
+      \State Reapply action mask $\mathbf{m}_t$; compute
+             $\log\pi_\theta(a_t|s_t)$
+      \State Compute $\mathcal{L}(\theta)$ via
+             \eqref{eq:ppo_loss}--\eqref{eq:entropy}
+      \State Update: $\theta \leftarrow \theta - \eta
+             \,\nabla_\theta\mathcal{L}(\theta)$
+             with gradient clipping ($\|\nabla\|_2 \leq 0.5$)
+    \EndFor
+  \EndFor
+
+\EndWhile
+\State \Return trained policy $\pi_\theta$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Remark on the environment step.}
+The call $\mathcal{E}.\textsc{Step}(a_t)$ encapsulates a
+six-stage pipeline:
+(i) decode and apply the shaping operator to $\mathcal{G}_T$;
+(ii) run the mobility-aware greedy scheduler on the modified
+graph $\mathcal{G}_T'$ with current $\mathbf{B}(t)$
+and $\tilde{\boldsymbol{\phi}}(t)$;
+(iii) deduct battery according to \eqref{eq:energy_depletion};
+(iv) advance UAV positions via the Random Waypoint model;
+(v) compute the reward $r_t$;
+(vi) construct the updated observation $s_{t+1}$.
+This deterministic, non-differentiable environment step is the
+reason RL is necessary: the combinatorial scheduling layer prevents
+end-to-end gradient propagation from the task-assignment outcome
+back through the graph-shaping decision.

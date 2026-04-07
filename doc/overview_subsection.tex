@@ -1,0 +1,40 @@
+% Overview of RTGS Framework — compact (~1/4 page)
+% IEEE Transactions style | third-person passive
+
+\subsection{Overview of the RTGS Framework}
+\label{subsec:overview}
+
+Conventional offloading frameworks treat the microservice DAG
+$\mathcal{G}_t = (\mathcal{V}_t, \mathcal{E}_t)$ as a fixed input
+and optimise only the task-to-UAV assignment
+$\pi^*: \mathcal{V}_t \to \mathcal{V}_r$.
+This decoupled strategy is inherently limited in heterogeneous UAV
+swarms: as UAVs move, link bandwidths $B_{kl}(n)$ fluctuate and
+battery depletion shrinks $\tilde{\phi}_k(n)$, so a topology that
+yields a feasible schedule at epoch $n$ may violate the deadline at
+epoch $n{+}1$—even under an optimal fixed-graph assignment policy.
+
+RTGS addresses this limitation by promoting the graph topology itself
+to a control variable, seeking the joint solution
+\begin{equation}
+  (\mathcal{G}_t^{\ast},\,\pi^{\ast}) =
+  \arg\min_{\mathcal{G}_t' \in \Omega,\;\pi}\;
+  T_{\mathrm{span}}\!\bigl(\mathcal{G}_t',\,\pi,\,\mathcal{G}_r(n)\bigr),
+  \label{eq:joint_opt}
+\end{equation}
+where $\Omega$ is the set of DAGs reachable from $\mathcal{G}_t$ via
+the \textsc{Split} and \textsc{Merge} operators defined in
+Section~\ref{subsubsec:operators}.
+As illustrated in Fig.~\ref{fig:framework}, RTGS realises
+\eqref{eq:joint_opt} through three tightly coupled components:
+(i)~a \textbf{dual-graph GNN} with cross-attention encodes the
+joint state of $\mathcal{G}_t$ and $\mathcal{G}_r(n)$ into
+resource-aware per-node embeddings;
+(ii)~a \textbf{node-level PPO agent} selects a graph-shaping action
+from a 211-dimensional space ($1$ noop, $20$ split, $190$ merge)
+conditioned on those embeddings;
+and (iii)~a \textbf{deterministic greedy scheduler} maps the
+reshaped graph $\mathcal{G}_t'$ to a concrete UAV assignment,
+whose outcome closes the feedback loop as the reward signal.
+Because the scheduling layer is non-differentiable, RL is the
+natural vehicle for optimising the topology decisions end-to-end.

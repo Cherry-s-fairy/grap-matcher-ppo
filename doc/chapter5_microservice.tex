@@ -1,0 +1,459 @@
+% ============================================================
+%  Chapter 5 / Section V
+%  RTGS-Based Microservice Deployment
+%
+%  IEEE Transactions style  |  English  |  third-person passive
+%
+%  Notation (defined here; supersedes earlier sections where noted):
+%    \mathcal{G}_t = (\mathcal{V}_t, \mathcal{E}_t)
+%        Task graph  — subscript 't' denotes *task*, NOT time.
+%        v_i \in \mathcal{V}_t : microservice (task) node
+%        e_{i,j} \in \mathcal{E}_t : data-dependency edge
+%
+%    \mathcal{G}_r = (\mathcal{V}_r, \mathcal{E}_r)
+%        UAV resource graph  — subscript 'r' denotes *resource*.
+%        u_k \in \mathcal{V}_r : UAV node
+%
+%    n  — decision epoch (integer step index, avoids clash with
+%          the task subscript 't')
+%    N  = |\mathcal{V}_t|  — current task count (N \leq N_{\max}=20)
+%    M  = |\mathcal{V}_r|  — fleet size (M = 8)
+%
+%  Required preamble packages:
+%    \usepackage{amsmath, amssymb, bm}
+%    \usepackage{algorithm, algpseudocode}
+%    \usepackage{booktabs, multirow}
+%    \usepackage{enumitem}
+% ============================================================
+
+% ----------------------------------------------------------------
+\section{RTGS-Based Microservice Deployment}
+\label{sec:microservice}
+
+Edge-computing deployments on heterogeneous UAV swarms introduce a
+class of workload management problems that differs fundamentally from
+conventional cloud scheduling.
+Microservice pipelines—containerised functional units connected by
+explicit data-flow dependencies—map naturally onto DAGs, yet the
+physical substrate on which they execute is radically non-stationary:
+UAV bandwidth fluctuates with inter-vehicle distance, compute
+capacity shrinks as batteries deplete, and the active set of
+executable nodes contracts over time.
+Static graph-to-UAV mapping strategies that treat the microservice
+DAG as a fixed input fail to exploit this dynamism;
+they cannot, for instance, consolidate two lightweight services to
+eliminate a cross-UAV transfer when the intervening wireless link
+degrades, nor decompose a bottleneck service to exploit a suddenly
+available high-CPU UAV.
+
+This section instantiates the RTGS framework introduced in
+Section~\ref{sec:method} for the microservice deployment problem.
+The task graph $\mathcal{G}_t = (\mathcal{V}_t, \mathcal{E}_t)$
+represents the microservice pipeline, where each node
+$v_i \in \mathcal{V}_t$ is one deployable service instance and each
+directed edge $e_{i,j} \in \mathcal{E}_t$ encodes a data dependency
+requiring intermediate results to be transferred from the UAV
+executing $v_i$ to the UAV executing $v_j$ before $v_j$ may start.
+The UAV swarm is modelled as a resource graph
+$\mathcal{G}_r = (\mathcal{V}_r, \mathcal{E}_r)$, where
+$\mathcal{V}_r = \{u_1, \ldots, u_M\}$ is the fleet and
+$\mathcal{E}_r$ is the fully-connected edge set representing all
+pairwise communication channels.
+
+The remainder of this section is organised as follows.
+Section~\ref{subsec:mdp} formalises the MDP over the joint state of
+$\mathcal{G}_t$ and $\mathcal{G}_r$.
+Section~\ref{subsec:gnn_attn} describes how task and resource
+features are extracted and fused via dual-graph GNNs and a
+cross-graph attention mechanism.
+Section~\ref{subsec:operators} derives the graph-theoretic
+properties of the Split and Merge shaping operators.
+Section~\ref{subsec:ppo_mask} presents the PPO training procedure
+with structural action masking that guarantees all graph
+transformations preserve DAG acyclicity.
+
+% ----------------------------------------------------------------
+\subsection{MDP Formulation}
+\label{subsec:mdp}
+
+The RTGS microservice deployment problem is formalised as a finite-horizon
+Markov Decision Process
+$\mathcal{M} = \langle\mathcal{S},\,\mathcal{A},\,\mathcal{R},\,\gamma\rangle$.
+
+% - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+\subsubsection{State Space $\mathcal{S}$}
+\label{subsubsec:state}
+
+A state $s \in \mathcal{S}$ at decision epoch $n$ is a composite
+observation:
+\begin{equation}
+  s =
+  \bigl(
+    \mathbf{X}_t,\;\mathbf{E}_t,\;
+    \mathbf{X}_r^{(n)},\;\mathbf{E}_r,\;
+    \mathbf{f}^{(n)}
+  \bigr),
+  \label{eq:state_full}
+\end{equation}
+where $\mathbf{X}_t$ and $\mathbf{E}_t$ encode the current microservice
+graph, $\mathbf{X}_r^{(n)}$ encodes the time-varying UAV resource state,
+$\mathbf{E}_r$ is the fixed resource-graph edge index, and
+$\mathbf{f}^{(n)}$ is the scheduling feedback vector from the preceding
+epoch.
+Each component is detailed below.
+
+\paragraph{Task-Graph Features}
+
+The microservice graph $\mathcal{G}_t$ is encoded as a zero-padded
+node-feature matrix
+$\mathbf{X}_t \in \mathbb{R}^{N_{\max} \times 2}$,
+where $N_{\max} = 20$ is the maximum admissible service count.
+The feature vector of service $v_i$ is
+\begin{equation}
+  \mathbf{x}_i^t = \bigl[c_i,\; d_i\bigr]^\top,
+  \label{eq:task_feat}
+\end{equation}
+where $c_i > 0$ (CPU units) is the compute demand of $v_i$ and
+$d_i > 0$ (MB) is its local data volume.
+Each dependency edge $e_{i,j} \in \mathcal{E}_t$ additionally carries
+a transfer volume $\delta_{ij} \geq 0$ (MB), representing the payload
+that must be communicated from the executor of $v_i$ to the executor
+of $v_j$.
+The edge set is stored as a COO-format index
+$\mathbf{E}_t \in \mathbb{Z}^{2 \times N_{\max}^2}$, zero-padded
+to a fixed buffer.
+Padding rows in $\mathbf{X}_t$ are identically zero and are excluded
+from all graph operations via Boolean masking.
+
+\paragraph{Resource-Graph Features}
+
+Unlike the task graph, the resource-graph feature matrix
+$\mathbf{X}_r^{(n)} \in [0,1]^{M \times 3}$ is \emph{re-computed at
+every epoch} by the mobility model, reflecting the current physical
+state of the swarm.
+The feature vector of UAV $u_k$ at epoch $n$ is
+\begin{equation}
+  \mathbf{x}_k^r(n) =
+  \Bigl[
+    \underbrace{\tilde{\phi}_k(n)\,/\,\phi^{\max}}_{\text{CPU ratio}},\quad
+    \underbrace{\bar{B}_k(n)\,/\,B_{\max}}_{\text{BW ratio}},\quad
+    \underbrace{\beta_k(n)}_{\text{battery}}
+  \Bigr]^\top \!\in [0,1]^3,
+  \label{eq:res_feat}
+\end{equation}
+where the three components are defined as follows.
+
+\textit{Battery-derated CPU ratio.}
+The effective CPU capacity of $u_k$ is a piecewise function of its
+residual battery $\beta_k(n) \in [0,1]$:
+\begin{equation}
+  \tilde{\phi}_k(n) =
+  \begin{cases}
+    0,          & \beta_k(n) = 0
+                  \;\text{(depleted — offline)},\\
+    \gamma\,\phi_k, & 0 < \beta_k(n) < \beta_{\mathrm{low}}
+                  \;\text{(low-power mode, \(\gamma = 0.5\))},\\
+    \phi_k,     & \beta_k(n) \geq \beta_{\mathrm{low}}
+                  \;\text{(nominal)},
+  \end{cases}
+  \label{eq:cpu_derate}
+\end{equation}
+with low-power threshold $\beta_{\mathrm{low}} = 0.20$ and nominal
+CPU capacity $\phi_k$ drawn from the heterogeneous fleet profile.
+The CPU ratio is then $\tilde{\phi}_k(n)/\phi^{\max}$, where
+$\phi^{\max} = \max_k \phi_k$ is the fleet-wide ceiling.
+
+\textit{Mean link-bandwidth ratio.}
+The pairwise link bandwidth between active UAVs $u_k$ and $u_l$ is
+governed by an exponential distance-decay model:
+\begin{equation}
+  B_{kl}(n) =
+  \begin{cases}
+    B_{\min} + \bigl(B_{\max} - B_{\min}\bigr)\,
+      e^{-r_{kl}(n)/\delta_H},
+      & r_{kl}(n) \leq D_c, \\
+    B_{\min},
+      & r_{kl}(n) > D_c,
+  \end{cases}
+  \label{eq:bw_model}
+\end{equation}
+where $r_{kl}(n)$ is the Euclidean inter-UAV distance at epoch $n$,
+$\delta_H = 150\,\text{m}$ is the characteristic decay distance,
+$D_c = 400\,\text{m}$ is the communication radius,
+$B_{\max} = 1600\,\text{Mbps}$, and $B_{\min} = 200\,\text{Mbps}$.
+The mean-bandwidth feature is
+\begin{equation}
+  \bar{B}_k(n) =
+  \frac{1}{|\mathcal{U}_a(n)| - 1}
+  \sum_{\substack{u_l \in \mathcal{U}_a(n) \\ l \neq k}}
+  B_{kl}(n),
+  \label{eq:avg_bw}
+\end{equation}
+where $\mathcal{U}_a(n) = \{u_k : \beta_k(n) > 0\}$ is the active
+UAV set at epoch $n$.
+All three feature dimensions are normalised to $[0,1]$,
+yielding a scale-invariant input for the GNN encoder.
+
+\paragraph{Scheduling Feedback Vector}
+
+The six-dimensional feedback vector
+$\mathbf{f}^{(n)} \in \mathbb{R}^6$ summarises the outcome of the
+greedy scheduler applied to the task graph at the end of epoch $n$:
+\begin{equation}
+  \mathbf{f}^{(n)} =
+  \Bigl[
+    \underbrace{\lambda^{(n)}}_{\text{latency ratio}},\;
+    \underbrace{\sigma^{(n)}}_{\text{success rate}},\;
+    \underbrace{\varrho^{(n)}}_{\text{reschedule count}},\;
+    \underbrace{\bar{u}^{(n)}}_{\text{fleet util.}},\;
+    \underbrace{\hat{B}_{\min}^{(n)}}_{\text{min BW ratio}},\;
+    \underbrace{\hat{\beta}_{\min}^{(n)}}_{\text{min battery}}
+  \Bigr]^\top,
+  \label{eq:feedback_vec}
+\end{equation}
+where:
+\begin{itemize}[leftmargin=*, itemsep=1pt]
+  \item $\lambda^{(n)} = T_{\mathrm{span}}^{(n)}\,/\,T_D \in \mathbb{R}_{\geq 0}$
+        is the schedule makespan normalised by the deadline $T_D$;
+        $\lambda > 1$ indicates a deadline miss.
+  \item $\sigma^{(n)} \in [0,1]$
+        is the fraction of services successfully assigned to an
+        active UAV with sufficient residual CPU.
+  \item $\varrho^{(n)} \in \mathbb{Z}_{\geq 0}$
+        counts services that required a forced assignment to an
+        overloaded UAV (partial execution).
+  \item $\bar{u}^{(n)} \in [0,1]$
+        is the mean CPU utilisation across all active UAVs.
+  \item $\hat{B}_{\min}^{(n)} = \min_{k \neq l,\,
+        u_k,u_l \in \mathcal{U}_a} B_{kl}(n)\,/\,B_{\max} \in [0,1]$
+        is the weakest active inter-UAV link, providing a
+        mobility-induced fragmentation signal.
+  \item $\hat{\beta}_{\min}^{(n)} = \min_k \beta_k(n) \in [0,1]$
+        is the most-depleted UAV's battery fraction,
+        signalling impending loss of fleet nodes.
+\end{itemize}
+The joint inclusion of link-quality and battery signals in the state
+is a deliberate design choice: both are non-stationary quantities
+that directly determine whether Split (exploiting available CPU) or
+Merge (eliminating weak-link transfers) is the more profitable action
+at epoch $n$.
+
+% - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+\subsubsection{Action Space $\mathcal{A}$}
+\label{subsubsec:action}
+
+The action set $\mathcal{A}$ is a flat discrete space of
+\emph{node-level graph shaping operations}:
+\begin{equation}
+  \mathcal{A} =
+  \underbrace{\{a_{\varnothing}\}}_{\text{noop}}
+  \;\cup\;
+  \underbrace{\bigl\{a_i^{\mathrm{sp}} : i \in [N_{\max}]\bigr\}}_{\text{Split actions}}
+  \;\cup\;
+  \underbrace{\bigl\{a_{ij}^{\mathrm{me}} :
+    0 \leq i < j < N_{\max}\bigr\}}_{\text{Merge actions}},
+  \label{eq:action_set}
+\end{equation}
+with total cardinality
+\begin{equation}
+  |\mathcal{A}| = 1 + N_{\max} + \binom{N_{\max}}{2}
+               = 1 + 20 + 190 = 211.
+  \label{eq:action_dim}
+\end{equation}
+
+In practice, actions are represented as a single integer
+$a \in \{0, 1, \ldots, 210\}$ and decoded via a fixed lookup table
+into a structured triple $(op,\,p_i,\,p_j)$, where $op$ identifies
+the operation type and $p_i,\,p_j \in [N_{\max}]$ are
+\emph{padded node positions} (indices into the sorted node list of
+the current graph):
+\begin{equation}
+  \mathrm{decode}(a) =
+  \begin{cases}
+    (\mathrm{noop},\; -,\; -)
+      & a = 0, \\[3pt]
+    (\mathrm{split},\; a - 1,\; -)
+      & 1 \leq a \leq N_{\max}, \\[3pt]
+    \bigl(\mathrm{merge},\; p_i^{(a)},\; p_j^{(a)}\bigr)
+      & N_{\max} < a \leq 210,
+  \end{cases}
+  \label{eq:decode}
+\end{equation}
+where $(p_i^{(a)},\, p_j^{(a)})$ is the $(a - N_{\max} - 1)$-th
+entry of the pre-enumerated lexicographic list of all
+$\binom{20}{2} = 190$ ordered pairs $(i,j)$, $0 \leq i < j < 20$.
+
+\begin{table}[t]
+  \centering
+  \caption{Decomposition of the 211-Dimensional Action Space}
+  \label{tab:action_space}
+  \begin{tabular}{@{}lccl@{}}
+    \toprule
+    Type & Index range & Count & Semantics \\
+    \midrule
+    Noop   & $0$              & $1$   & No topology change \\
+    Split  & $1$ -- $20$      & $20$  & Split node at padded position $a-1$ \\
+    Merge  & $21$ -- $210$    & $190$ & Merge pair $(p_i^{(a)}, p_j^{(a)})$,\;
+                                        $\binom{20}{2}$ lex.\ pairs \\
+    \midrule
+    Total  & $0$ -- $210$     & $\mathbf{211}$ & \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Table~\ref{tab:action_space} summarises the index layout.
+Node-level granularity is the key distinction from prior work
+that restricts the shaping policy to a coarse three-way choice
+(noop / split-heaviest / merge-cheapest): here the agent
+selects \emph{which specific service} to restructure, conditioned
+on cross-graph attention weights that reflect the current UAV
+resource context (see Section~\ref{subsec:gnn_attn}).
+This fine-grained design expands the action space by two orders of
+magnitude relative to a coarse binary policy, but the increase is
+managed through structural action masking
+(Section~\ref{subsec:ppo_mask}) that eliminates infeasible actions
+before sampling.
+
+% - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+\subsubsection{Reward Function $\mathcal{R}$}
+\label{subsubsec:reward}
+
+The reward $r^{(n)}$ at epoch $n$ is composed of three semantically
+distinct terms:
+\begin{equation}
+  \boxed{
+  r^{(n)} =
+    \underbrace{r_{\mathrm{qual}}^{(n)}}_{\text{absolute quality}}
+    +\;
+    \underbrace{r_{\Delta}^{(n)}}_{\text{incremental gain}}
+    +\;
+    \underbrace{r_{\mathrm{pen}}^{(n)}}_{\text{penalty}}
+  }
+  \label{eq:reward_decomp}
+\end{equation}
+
+\paragraph{Absolute Quality Term $r_{\mathrm{qual}}$}
+
+This term rewards the agent for achieving high service success rates
+and feasible latencies at every epoch, regardless of the previous
+state.
+It ensures that a policy which \emph{maintains} excellent performance
+continues to receive positive reinforcement:
+\begin{equation}
+  r_{\mathrm{qual}}^{(n)} =
+    \underbrace{2\,\sigma^{(n)}}_{\text{success rate}}
+    \;+\;
+    \underbrace{1.5\,\max\!\bigl(0,\;1 - \lambda^{(n)}\bigr)}_{\text{latency margin}}.
+  \label{eq:r_qual}
+\end{equation}
+The coefficient $2$ on the success-rate term is larger than the
+$1.5$ latency coefficient, reflecting the priority that all services
+must be deployable over merely meeting the deadline.
+
+\paragraph{Incremental Improvement Term $r_{\Delta}$}
+
+This term provides dense shaping by rewarding step-to-step
+improvements in both scheduling dimensions, preventing the policy
+from stagnating in any mediocre-but-stable local optimum:
+\begin{equation}
+  r_{\Delta}^{(n)} =
+    \underbrace{
+      \bigl(\lambda^{(n-1)} - \lambda^{(n)}\bigr)
+    }_{\text{latency reduction}}
+    +\;
+    \underbrace{
+      0.5\,\bigl(\sigma^{(n)} - \sigma^{(n-1)}\bigr)
+    }_{\text{success gain}},
+  \label{eq:r_delta}
+\end{equation}
+where $\lambda^{(n-1)}$ and $\sigma^{(n-1)}$ are the values from
+the preceding epoch, initialised at episode start to $\lambda^{(0)}=1$
+(at-deadline) and $\sigma^{(0)}=0$ (no success).
+Both delta terms admit negative values, penalising performance
+regression.
+The asymmetric weight $(1.0\;\text{vs.}\;0.5)$ assigns greater
+incentive to latency reduction, consistent with the latency-sensitive
+nature of microservice pipelines.
+
+\paragraph{Penalty Term $r_{\mathrm{pen}}$}
+
+Three negative sub-terms discourage distinct failure modes:
+\begin{equation}
+  r_{\mathrm{pen}}^{(n)} =
+    \underbrace{
+      -\,\frac{\varrho^{(n)}}{N^{(n)}}
+    }_{\substack{\text{reschedule} \\ \text{rate}}}
+    \;-\;
+    \underbrace{
+      2\,\max\!\bigl(0,\;\lambda^{(n)} - 1\bigr)
+    }_{\substack{\text{deadline} \\ \text{overshoot}}}
+    \;-\;
+    \underbrace{
+      0.05\,\max\!\bigl(0,\;N^{(n)} - (N_{\max}-2)\bigr)
+    }_{\substack{\text{topology} \\ \text{inflation}}},
+  \label{eq:r_pen}
+\end{equation}
+where $N^{(n)} = |\mathcal{V}_t^{(n)}|$ is the task-graph size at
+epoch $n$.
+
+\textit{Reschedule-rate penalty.}
+Rather than penalising the raw count $\varrho^{(n)}$, the term is
+normalised by the current graph size $N^{(n)}$.
+This removes a systematic bias: a graph with twice as many nodes
+naturally produces twice as many absolute reschedule events even if
+the per-node rescheduling rate is identical, so raw-count penalties
+would unfairly discourage productive Split operations that increase
+$N^{(n)}$.
+
+\textit{Deadline-overshoot penalty.}
+The penalty grows linearly with the fractional latency excess
+$(\lambda^{(n)} - 1)$ rather than applying a hard threshold,
+preserving gradient information throughout the overconstrained
+regime.
+The coefficient $2.0$ is calibrated to dominate the maximum
+achievable absolute-quality term $r_{\mathrm{qual}}$, ensuring
+that deadline satisfaction is the primary objective.
+
+\textit{Topology-inflation penalty.}
+A weak coefficient of $0.05$ activates only when
+$N^{(n)} > N_{\max} - 2 = 18$, i.e., within two nodes of the hard
+capacity ceiling.
+This prevents degenerate schedules in which the agent continuously
+applies Split to bloat the graph—a failure mode that can arise
+when the split logit receives strong gradient without a size
+constraint.
+The threshold is set two below $N_{\max}$ rather than at $N_{\max}$
+itself to preserve a safety buffer: the policy can still execute one
+more Split operation before the hard constraint blocks it.
+
+\paragraph{Combined Reward Expression}
+
+Substituting \eqref{eq:r_qual}--\eqref{eq:r_pen} into
+\eqref{eq:reward_decomp} gives the full scalar reward:
+\begin{align}
+  r^{(n)} =\;&
+    2\,\sigma^{(n)}
+    + 1.5\,\max\!\bigl(0,\;1-\lambda^{(n)}\bigr)
+    \nonumber\\
+    &+ \bigl(\lambda^{(n-1)} - \lambda^{(n)}\bigr)
+    + 0.5\,\bigl(\sigma^{(n)} - \sigma^{(n-1)}\bigr)
+    \nonumber\\
+    &- \frac{\varrho^{(n)}}{N^{(n)}}
+    - 2\,\max\!\bigl(0,\;\lambda^{(n)}-1\bigr)
+    \nonumber\\
+    &- 0.05\,\max\!\bigl(0,\;N^{(n)}-18\bigr).
+  \label{eq:reward_full}
+\end{align}
+The discount factor $\gamma = 0.99$ is applied in computing the
+return $R^{(n)} = \sum_{k \geq 0} \gamma^k r^{(n+k)}$.
+
+\paragraph{Termination Conditions}
+
+An episode terminates under two conditions.
+\textit{Catastrophic failure}: the schedule makespan exceeds twice
+the deadline, $T_{\mathrm{span}}^{(n)} > 2\,T_D$, indicating an
+irrecoverable scheduling collapse (e.g., total fleet depletion).
+\textit{Horizon truncation}: the step count reaches the maximum
+episode length $N_{\mathrm{ep}} = 50$, at which point the episode
+is truncated and a bootstrap value estimate replaces the terminal
+return.
