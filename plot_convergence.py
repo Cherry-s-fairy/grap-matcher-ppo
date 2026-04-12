@@ -43,9 +43,9 @@ SMOOTH        = 50      # for reward convergence line plot only
 ALPHA         = 0.18
 
 CONFIGS = {
-    "rl_node":   {"color": "#2166ac", "label": "Static-PPO",  "zorder": 3},
+    "rl_node":   {"color": "#2166ac", "label": "PPO-base",  "zorder": 3},
     "rsdqn":     {"color": "#4dac26", "label": "RSDQN",       "zorder": 4},
-    "rl_global": {"color": "#d6604d", "label": "RTGS (Ours)", "zorder": 5},
+    "rl_global": {"color": "#d6604d", "label": "RTGS-PPO (Ours)", "zorder": 5},
 }
 
 # metric definitions: (field, y_label, title, as_pct, y_margin_frac)
