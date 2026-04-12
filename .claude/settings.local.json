@@ -6,7 +6,13 @@
       "Bash(pip list:*)",
       "Bash(cd:*)",
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(''''Keys:'''', list\\(d.keys\\(\\)\\)\\); print\\(''''Length of first key:'''', len\\(d[list\\(d.keys\\(\\)\\)[0]]\\)\\)\")",
-      "Read(//c/Users/27183/**)"
+      "Read(//c/Users/27183/**)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(type\\(d\\)\\); print\\(list\\(d.keys\\(\\)\\) if isinstance\\(d, dict\\) else d[:3]\\)\")",
+      "Bash(python3:*)",
+      "Bash(where python:*)",
+      "Bash(py --version)",
+      "Bash(pip install:*)",
+      "Bash(ls:*)"
     ]
   }
 }
