@@ -1,0 +1,70 @@
+% MDP Formulation — compact (~1/3 page)
+% IEEE Transactions style | third-person passive
+
+\subsection{MDP Formulation}
+\label{subsec:mdp}
+
+The RTGS control problem is cast as a Markov Decision Process
+$\langle \mathcal{S}, \mathcal{A}, \mathcal{R}, \gamma \rangle$
+with four elements defined as follows.
+
+\smallskip
+\noindent\textbf{State} $s_n \in \mathcal{S}$.
+The state at decision epoch $n$ is
+\begin{equation}
+  s_n = \bigl(\mathbf{z}_n,\; \mathbf{f}_n\bigr),
+  \label{eq:state}
+\end{equation}
+where $\mathbf{z}_n$ is the joint graph embedding produced by the
+dual-graph GNN from $(\mathcal{G}_t, \mathcal{G}_r(n))$
+(detailed in Section~\ref{subsec:gnn}), and
+$\mathbf{f}_n \in \mathbb{R}^6$ is the scheduling feedback vector
+$[\lambda_n, \sigma_n, \varrho_n, \bar{u}_n,
+  \hat{B}_{\min,n}, \hat{\beta}_{\min,n}]^\top$
+encoding latency ratio, task success rate, reschedule count,
+fleet utilisation, minimum link bandwidth, and minimum battery.
+
+\smallskip
+\noindent\textbf{Action} $a_n \in \mathcal{A}$.
+Each action selects a node-level graph-shaping operation:
+\begin{equation}
+  \mathcal{A} = \{\textit{noop}\}
+    \cup \bigl\{\textsc{Split}(v_i)\bigr\}_{i=1}^{N_{\max}}
+    \cup \bigl\{\textsc{Merge}(v_i,v_j)\bigr\}_{i < j},
+    \quad |\mathcal{A}| = 211.
+  \label{eq:action}
+\end{equation}
+An action mask enforces structural feasibility
+(DAG acyclicity, graph-size bound, fleet CPU availability)
+before every sampling step.
+
+\smallskip
+\noindent\textbf{Reward} $r_n \in \mathcal{R}$.
+The scalar reward balances schedule quality against deadline
+compliance:
+\begin{equation}
+  r_n =
+    \underbrace{2\sigma_n + 1.5\max(0,\,1-\lambda_n)}_{\text{quality}}
+    + \underbrace{(\lambda_{n-1}-\lambda_n)}_{\text{improvement}}
+    - \underbrace{2\max(0,\,\lambda_n-1)}_{\text{deadline penalty}},
+  \label{eq:reward}
+\end{equation}
+where $\lambda_n = T_{\mathrm{span}}(n)/T_D$ is the normalised
+makespan.
+Additional small penalties on the per-node reschedule rate and
+graph inflation are omitted here for brevity.
+
+\smallskip
+\noindent\textbf{Transition} $\mathcal{T}$.
+Applying action $a_n$ transforms the task graph deterministically,
+\begin{equation}
+  \mathcal{G}_t' = \textsc{Op}(\mathcal{G}_t,\, a_n),
+  \label{eq:transition}
+\end{equation}
+after which the greedy scheduler maps $\mathcal{G}_t'$ to a UAV
+assignment under the current resource state $\mathcal{G}_r(n)$,
+UAV positions advance via the Random Waypoint model, and the
+resulting scheduling outcome yields $s_{n+1}$ and $r_n$.
+The stochasticity in the transition arises solely from UAV
+mobility; given a fixed mobility trajectory the transition is
+fully deterministic.
