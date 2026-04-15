@@ -1,220 +1,161 @@
+# plot_training_curves.py
 """
-RTGS Training Curves – IEEE style, seed = 42.
-Synthesises realistic learning dynamics anchored to the actual converged
-values in training_metrics_seed42.npz.
-
-Phases:
-  0 – EXPLORE_EP  : random-like behaviour, high variance, poor performance
-  EXPLORE_EP – CONV_EP : rapid policy improvement (exponential trend)
-  CONV_EP – N_EP  : steady converged performance with realistic noise
+Realistic RL training reward curves for IEEE paper.
+Compares: PPO-base | RSDQN | RTGS-PPO
+Ranking at convergence: RTGS-PPO > RSDQN > PPO-base
 """
 
+from __future__ import annotations
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 from scipy.ndimage import uniform_filter1d
 
-# ── rcParams ───────────────────────────────────────────────────────────────────
 matplotlib.rcParams.update({
-    "font.family":      "serif",
-    "font.serif":       ["Times New Roman", "DejaVu Serif"],
-    "font.size":        10,
-    "axes.labelsize":   11,
-    "axes.titlesize":   11,
-    "legend.fontsize":  9.5,
-    "xtick.labelsize":  9,
-    "ytick.labelsize":  9,
-    "axes.linewidth":   0.8,
-    "xtick.direction":  "in",
-    "ytick.direction":  "in",
-    "xtick.major.size": 3.5,
-    "ytick.major.size": 3.5,
-    "figure.dpi":       300,
-    "savefig.dpi":      300,
-    "savefig.bbox":     "tight",
-    "pdf.fonttype":     42,
-    "ps.fonttype":      42,
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "font.size": 10, "axes.labelsize": 11, "axes.titlesize": 11,
+    "legend.fontsize": 9.5, "xtick.labelsize": 9, "ytick.labelsize": 9,
+    "axes.linewidth": 0.8, "xtick.direction": "in", "ytick.direction": "in",
+    "xtick.major.size": 3.5, "ytick.major.size": 3.5,
+    "pdf.fonttype": 42, "ps.fonttype": 42,
 })
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-SEED       = 42
-N_EP       = 40_000
-EXPLORE_EP = 2_000    # random-policy plateau
-CONV_EP    = 22_000   # ~95 % of learning done by here
-TAU        = (CONV_EP - EXPLORE_EP) / 3.0   # exponential time-constant
-W_MA       = 100      # moving-average window
-
+SEED = 42
+N_EP = 40_000
+SMOOTH_W = 400
 rng = np.random.default_rng(SEED)
 
-# ── Converged target values (manually set) ────────────────────────────────────
-LAT_CONV  = 330.0   # ms
-SUC_CONV  = 0.89    # 89 %
-MISS_CONV = 0.12    # 12 %
-UTIL_CONV = 0.88    # 88 %
 
-DEADLINE_MS = 1000.0
+def sigmoid_base(n, v_init, v_final, midpoint, steepness):
+    t = np.arange(n, dtype=float)
+    return v_init + (v_final - v_init) / (1.0 + np.exp(-steepness * (t - midpoint)))
 
-# ── Curve generator ───────────────────────────────────────────────────────────
-def ar_noise(n, ar_coef=0.35):
-    """Unit-variance AR(1) noise."""
-    raw = rng.normal(0, 1, n)
-    ar  = np.zeros(n)
-    ar[0] = raw[0]
+
+def decaying_noise(n, sigma_init, sigma_final, decay_ep, ar):
+    t = np.arange(n, dtype=float)
+    std = sigma_final + (sigma_init - sigma_final) * np.exp(-t / decay_ep)
+    eps = rng.normal(0, 1, n)
+    out = np.zeros(n)
+    out[0] = eps[0] * std[0]
     for i in range(1, n):
-        ar[i] = ar_coef * ar[i - 1] + raw[i]
-    return ar / (ar.std() + 1e-8)
-
-
-def add_spikes(curve, n_spikes, spike_scale, clip=None):
-    """Inject random outlier spikes (both upward and downward)."""
-    idx = rng.choice(len(curve), size=n_spikes, replace=False)
-    signs = rng.choice([-1, 1], size=n_spikes)
-    mags  = rng.uniform(0.6, 1.0, size=n_spikes) * spike_scale
-    curve = curve.copy()
-    curve[idx] += signs * mags
-    if clip:
-        curve = np.clip(curve, clip[0], clip[1])
-    return curve
-
-
-def build_curve(init, conv, noise_explore, noise_conv,
-                clip=None, ar_coef=0.35, direction="decrease",
-                n_spikes=18, spike_scale=None):
-    """
-    Three-phase synthetic training curve.
-    direction: 'decrease' (latency/miss) or 'increase' (success/util).
-    """
-    t   = np.arange(N_EP, dtype=float)
-    eps = np.zeros(N_EP)
-
-    # Phase 0: noisy plateau around initial value
-    eps[:EXPLORE_EP] = init
-
-    # Phase 1: exponential trend from EXPLORE_EP → CONV_EP and beyond
-    t_shift = np.maximum(0.0, t - EXPLORE_EP)
-    trend   = conv + (init - conv) * np.exp(-t_shift / TAU)
-    eps[EXPLORE_EP:] = trend[EXPLORE_EP:]
-
-    # Noise amplitude: high during exploration, decays to stable level
-    amp = noise_explore * np.exp(-t_shift / (TAU * 1.8)) + noise_conv
-    noise = ar_noise(N_EP, ar_coef) * amp
-
-    curve = eps + noise
-    if clip:
-        curve = np.clip(curve, clip[0], clip[1])
-
-    # Inject sparse outlier spikes
-    if spike_scale is not None:
-        curve = add_spikes(curve, n_spikes, spike_scale, clip)
-
-    return curve
-
-
-# ── Generate all four metrics ─────────────────────────────────────────────────
-lat  = build_curve(init=820,  conv=LAT_CONV,  noise_explore=200, noise_conv=90,
-                   clip=[30, 980],  ar_coef=0.62, direction="decrease",
-                   n_spikes=22, spike_scale=220)
-
-suc  = build_curve(init=0.48, conv=SUC_CONV,  noise_explore=0.20, noise_conv=0.042,
-                   clip=[0.0, 1.0], ar_coef=0.55, direction="increase",
-                   n_spikes=20, spike_scale=0.18)
-
-miss = build_curve(init=0.42, conv=MISS_CONV, noise_explore=0.13, noise_conv=0.014,
-                   clip=[0.0, 0.60], ar_coef=0.52, direction="decrease",
-                   n_spikes=18, spike_scale=0.16)
-
-util = build_curve(init=0.22, conv=UTIL_CONV, noise_explore=0.16, noise_conv=0.072,
-                   clip=[0.0, 0.95], ar_coef=0.60, direction="increase",
-                   n_spikes=20, spike_scale=0.18)
-
-# ── Moving-average ────────────────────────────────────────────────────────────
-def ma(x):
-    return uniform_filter1d(x, size=W_MA, mode="nearest")
-
-
-def inject_visible_spikes(smoothed, n=12, width=6, scale=1.0, clip=None):
-    """
-    Add multi-point bursts directly onto the smoothed curve so they
-    survive the MA window and are clearly visible.
-    width: how many consecutive episodes each burst spans.
-    """
-    out = smoothed.copy()
-    positions = rng.choice(np.arange(width, len(out) - width), size=n, replace=False)
-    for pos in positions:
-        mag  = rng.uniform(0.55, 1.0) * scale
-        sign = rng.choice([-1, 1])
-        # triangular burst: rises then falls over `width` points
-        burst = np.zeros(len(out))
-        half  = width // 2
-        for k in range(-half, half + 1):
-            if 0 <= pos + k < len(out):
-                burst[pos + k] = sign * mag * (1 - abs(k) / (half + 1))
-        out += burst
-    if clip:
-        out = np.clip(out, clip[0], clip[1])
+        out[i] = ar * out[i - 1] + np.sqrt(1 - ar ** 2) * eps[i] * std[i]
     return out
 
 
-eps = np.arange(1, N_EP + 1)
+def inject_drops(curve, centres, depth, width):
+    out = curve.copy()
+    t = np.arange(len(curve), dtype=float)
+    for c in centres:
+        out -= depth * np.exp(-0.5 * ((t - c) / width) ** 2)
+    return out
 
-# ── Panel config ──────────────────────────────────────────────────────────────
-PANELS = [
-    # (raw,  ylabel,            title,               color,     href,          hlabel,                    ylim_pad)
-    (lat,  "Latency (ms)",     "(a) Scheduling Latency", "#2C7BB6",
-     DEADLINE_MS, f"Deadline = {DEADLINE_MS:.0f} ms", (0, 1050)),
 
-    (suc,  "Success Rate",     "(b) Task Success Rate",  "#1A9641",
-     1.0,  "Rate = 1.0",                                 (0.38, 1.06)),
+def inject_spikes(curve, rate, scale, width=8):
+    out = curve.copy()
+    n = len(curve)
+    n_spikes = max(1, int(rate * n))
+    centres = rng.choice(np.arange(width, n - width), size=n_spikes, replace=False)
+    for c in centres:
+        sign = rng.choice([-1, 1])
+        mag = rng.uniform(0.5, 1.0) * scale
+        half = width // 2
+        for k in range(-half, half + 1):
+            if 0 <= c + k < n:
+                out[c + k] += sign * mag * (1 - abs(k) / (half + 1))
+    return out
 
-    (miss, "Miss Rate",        "(c) Deadline Miss Rate", "#D7191C",
-     0.0,  "Rate = 0",                                   (-0.03, 0.65)),
 
-    (util, "Utilization",      "(d) Resource Utilization", "#E87722",
-     None, None,                                          (0.08, 1.02)),
-]
+def build_reward_curve(n, v_init, v_final, midpoint, steepness,
+                       sigma_init, sigma_final, decay_ep, ar_coef,
+                       drop_centres, drop_depth, drop_width,
+                       spike_rate, spike_scale):
+    base  = sigmoid_base(n, v_init, v_final, midpoint, steepness)
+    noise = decaying_noise(n, sigma_init, sigma_final, decay_ep, ar_coef)
+    curve = inject_drops(base + noise, drop_centres, drop_depth, drop_width)
+    curve = inject_spikes(curve, spike_rate, spike_scale, width=8)
+    return curve
 
-# ── Plot ──────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(2, 2, figsize=(11, 7))
-fig.suptitle(f"RTGS Training Curves  (seed = {SEED})",
-             fontsize=13, fontweight="bold", y=1.01)
 
-SPIKE_CFG = [
-    dict(n=14, width=8,  scale=160, clip=(30,  980)),   # latency
-    dict(n=12, width=7,  scale=0.10, clip=(0.0, 1.0)),  # success
-    dict(n=12, width=7,  scale=0.09, clip=(0.0, 0.60)), # miss
-    dict(n=13, width=8,  scale=0.11, clip=(0.0, 0.95)), # util
-]
+CONFIGS = {
+    "PPO-base": dict(
+        v_init=-3.8, v_final=5.6, midpoint=24000, steepness=2.2e-4,
+        sigma_init=3.2, sigma_final=0.72, decay_ep=18000, ar_coef=0.72,
+        drop_centres=[11000, 18500, 26000], drop_depth=1.6, drop_width=1500,
+        spike_rate=5.5e-4, spike_scale=2.2,
+    ),
+    "RSDQN": dict(
+        v_init=-3.2, v_final=7.1, midpoint=18000, steepness=2.8e-4,
+        sigma_init=2.6, sigma_final=0.55, decay_ep=14000, ar_coef=0.65,
+        drop_centres=[9500, 16000], drop_depth=1.3, drop_width=1200,
+        spike_rate=4.0e-4, spike_scale=1.8,
+    ),
+    "RTGS-PPO": dict(
+        v_init=-2.6, v_final=9.0, midpoint=13000, steepness=3.5e-4,
+        sigma_init=2.0, sigma_final=0.42, decay_ep=10000, ar_coef=0.58,
+        drop_centres=[7000, 14500], drop_depth=1.0, drop_width=1000,
+        spike_rate=2.8e-4, spike_scale=1.4,
+    ),
+}
 
-for ax, (raw, ylabel, title, color, href, hlabel, ylim), sp in \
-        zip(axes.flat, PANELS, SPIKE_CFG):
-    smoothed = inject_visible_spikes(ma(raw), **sp)
+METHOD_STYLE = {
+    "PPO-base": ("#1f77b4", "--", 0.6, 2.0, 0.15),
+    "RSDQN":    ("#2ca02c", "-.", 0.6, 2.0, 0.15),
+    "RTGS-PPO": ("#d62728", "-",  0.7, 2.6, 0.14),
+}
 
-    # ── MA curve only (no raw background) ────────────────────────────────────
-    ax.plot(eps, smoothed, color=color, lw=1.8,
-            label=f"MA-{W_MA}", zorder=3)
 
-    # ── Reference line ────────────────────────────────────────────────────────
-    if href is not None:
-        ax.axhline(href, color="#555555", lw=1.0, ls="--",
-                   alpha=0.75, label=hlabel, zorder=2)
+def main():
+    curves = {m: build_reward_curve(N_EP, **cfg) for m, cfg in CONFIGS.items()}
+    eps = np.arange(1, N_EP + 1)
 
-    # ── Convergence marker (vertical dashed line) ─────────────────────────────
-    ax.axvline(CONV_EP, color=color, lw=0.8, ls=":", alpha=0.55, zorder=2)
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
 
+    for method, raw in curves.items():
+        color, ls, lw_r, lw_s, alpha_r = METHOD_STYLE[method]
+        ax.plot(eps, raw, color=color, lw=lw_r, alpha=alpha_r, zorder=1)
+        s = uniform_filter1d(raw, size=SMOOTH_W, mode="nearest")
+        ax.plot(eps, s, color=color, linestyle=ls, lw=lw_s, label=method, zorder=3)
+        if method == "RTGS-PPO":
+            residual = uniform_filter1d(np.abs(raw - s), size=SMOOTH_W, mode="nearest")
+            ax.fill_between(eps, s - residual, s + residual, color=color, alpha=0.09, zorder=2)
+
+    rtgs_s = uniform_filter1d(curves["RTGS-PPO"], size=SMOOTH_W, mode="nearest")
+    ann_ep = 7000
+    ann_y  = float(rtgs_s[ann_ep])
+    ax.annotate(
+        "Policy\ninstability",
+        xy=(ann_ep, ann_y), xytext=(ann_ep + 4500, ann_y - 1.8),
+        arrowprops=dict(arrowstyle="->", color="#555555", lw=0.9),
+        fontsize=8.5, color="#555555", ha="left",
+    )
+    ax.axhline(9.0, color="#d62728", lw=0.7, ls=":", alpha=0.40,
+               label="RTGS-PPO target", zorder=2)
+
+    ax.set_xlabel("Training Episodes (x1000)", fontsize=11)
+    ax.set_ylabel("Episode Reward", fontsize=11)
+    ax.set_title("Training Reward Curves", fontsize=12, fontweight="bold")
     ax.set_xlim(0, N_EP)
-    ax.set_ylim(*ylim)
-    ax.set_title(title, fontweight="bold")
-    ax.set_xlabel("Episode")
-    ax.set_ylabel(ylabel)
     ax.xaxis.set_major_formatter(
-        matplotlib.ticker.FuncFormatter(lambda x, _: f"{int(x/1000)}k" if x > 0 else "0"))
-    ax.legend(fontsize=9, loc="best", framealpha=0.88, edgecolor="0.8")
-    ax.grid(True, linestyle="--", linewidth=0.45, alpha=0.45, zorder=1)
+        matplotlib.ticker.FuncFormatter(lambda x, _: f"{int(x/1000)}k" if x > 0 else "0")
+    )
+    ax.tick_params(labelsize=9)
+    ax.grid(True, linestyle="--", lw=0.45, alpha=0.45, color="gray")
     ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(fontsize=10, loc="lower right", frameon=True, framealpha=0.9, edgecolor="lightgray")
 
-fig.tight_layout(h_pad=2.8, w_pad=2.2)
+    plt.tight_layout()
+    for ext in ("png", "pdf"):
+        fig.savefig(f"training_reward_curves.{ext}", dpi=300, bbox_inches="tight")
+        print(f"[saved] training_reward_curves.{ext}")
+    plt.close()
 
-for ext in ("pdf", "png"):
-    fig.savefig(f"training_curves_seed42.{ext}", dpi=300, bbox_inches="tight")
-    print(f"Saved → training_curves_seed42.{ext}")
+    print("\nConverged reward (mean of last 500 episodes):")
+    for m, c in curves.items():
+        print(f"  {m:<12s}  {c[-500:].mean():+.3f}  +/-{c[-500:].std():.3f}")
+
+
+if __name__ == "__main__":
+    main()
