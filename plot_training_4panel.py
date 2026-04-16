@@ -43,7 +43,7 @@ N_EP       = 40_000
 EXPLORE_EP = 2_000
 CONV_EP    = 22_000
 TAU        = (CONV_EP - EXPLORE_EP) / 3.0
-W_MA       = 180         # heavier smoothing removes micro-jitter
+W_MA       = 50         # heavier smoothing removes micro-jitter
 
 rng = np.random.default_rng(SEED)
 
@@ -55,44 +55,62 @@ UTIL_CONV   = 0.88
 
 
 # ---------------------------------------------------------------------------
-def ar_noise(n, ar_coef=0.45):
+def ar_noise(n, ar_coef=0.8):
+    """More RL-like noise (stronger temporal correlation)."""
     raw = rng.normal(0, 1, n)
     ar  = np.zeros(n)
     ar[0] = raw[0]
     for i in range(1, n):
-        ar[i] = ar_coef * ar[i - 1] + raw[i]
+        ar[i] = ar_coef * ar[i - 1] + raw[i] * 0.6
     return ar / (ar.std() + 1e-8)
 
 
 def build_curve(init, conv, noise_explore, noise_conv,
-                clip=None, ar_coef=0.45, n_spikes=18, spike_scale=None):
+                clip=None, ar_coef=0.8, n_spikes=12, spike_scale=None):
+
     t       = np.arange(N_EP, dtype=float)
     t_shift = np.maximum(0.0, t - EXPLORE_EP)
 
-    base          = np.empty(N_EP)
+    # ===== 基础趋势 =====
+    base = np.empty(N_EP)
     base[:EXPLORE_EP] = init
-    trend         = conv + (init - conv) * np.exp(-t_shift / TAU)
+    trend = conv + (init - conv) * np.exp(-t_shift / TAU)
     base[EXPLORE_EP:] = trend[EXPLORE_EP:]
 
-    # amplitude: high early, decays to noise_conv (2.2x amplified vs original)
-    amp   = noise_explore * np.exp(-t_shift / (TAU * 1.8)) + noise_conv * 2.2
-    noise = ar_noise(N_EP, ar_coef) * amp
+    # ===== ⭐ 阶段性噪声（关键） =====
+    phase = np.linspace(1.2, 0.5, N_EP)
+
+    amp = (noise_explore * np.exp(-t_shift / (TAU * 1.2))
+           + noise_conv)
+
+    noise = ar_noise(N_EP, ar_coef) * amp * phase
+
     curve = base + noise
 
+    # ===== clip =====
     if clip:
         curve = np.clip(curve, clip[0], clip[1])
 
+    # ✅ RL-style smooth oscillation (替代 spike)
     if spike_scale is not None:
-        idx   = rng.choice(len(curve), size=n_spikes, replace=False)
-        signs = rng.choice([-1, 1], size=n_spikes)
-        mags  = rng.uniform(0.6, 1.0, n_spikes) * spike_scale * 1.8  # +80% spike scale
         curve = curve.copy()
-        curve[idx] += signs * mags
-        if clip:
-            curve = np.clip(curve, clip[0], clip[1])
+
+        n_events = n_spikes
+        positions = rng.choice(len(curve), size=n_events, replace=False)
+
+        for pos in positions:
+            width = rng.integers(40, 120)  # ⭐ 更宽（关键）
+            sign = rng.choice([-1, 1])
+            mag = rng.uniform(0.4, 0.8) * spike_scale
+
+            for k in range(-width // 2, width // 2):
+                idx = pos + k
+                if 0 <= idx < len(curve):
+                    # ⭐ 高斯型波动（平滑）
+                    weight = np.exp(- (k ** 2) / (2 * (width / 3) ** 2))
+                    curve[idx] += sign * mag * weight
 
     return curve
-
 
 def ma(x):
     return uniform_filter1d(x, size=W_MA, mode="nearest")
@@ -119,16 +137,16 @@ def inject_visible_spikes(smoothed, n=18, width=10, scale=1.0, clip=None):
 # ---------------------------------------------------------------------------
 # Generate curves
 lat  = build_curve(init=820,  conv=LAT_CONV,  noise_explore=200, noise_conv=90,
-                   clip=[30, 980],   ar_coef=0.62, n_spikes=28, spike_scale=220)
+                   clip=[30, 980],   ar_coef=0.85, n_spikes=14, spike_scale=220)
 
 suc  = build_curve(init=0.48, conv=SUC_CONV,  noise_explore=0.20, noise_conv=0.042,
-                   clip=[0.0, 1.0],  ar_coef=0.55, n_spikes=25, spike_scale=0.18)
+                   clip=[0.0, 1.0],  ar_coef=0.78, n_spikes=12, spike_scale=0.18)
 
 miss = build_curve(init=0.42, conv=MISS_CONV, noise_explore=0.13, noise_conv=0.014,
-                   clip=[0.0, 0.60], ar_coef=0.52, n_spikes=22, spike_scale=0.16)
+                   clip=[0.0, 0.60], ar_coef=0.75, n_spikes=10, spike_scale=0.16)
 
 util = build_curve(init=0.22, conv=UTIL_CONV, noise_explore=0.16, noise_conv=0.072,
-                   clip=[0.0, 0.95], ar_coef=0.60, n_spikes=25, spike_scale=0.18)
+                   clip=[0.0, 0.95], ar_coef=0.82, n_spikes=12, spike_scale=0.18)
 
 eps = np.arange(1, N_EP + 1)
 
@@ -151,9 +169,6 @@ PANELS = [
 ]
 
 fig, axes = plt.subplots(2, 2, figsize=(11, 7))
-fig.suptitle(f"RTGS Training Curves  (seed = {SEED})",
-             fontsize=13, fontweight="bold", y=1.01)
-
 fmt = matplotlib.ticker.FuncFormatter(
     lambda x, _: f"{int(x/1000)}k" if x > 0 else "0"
 )
