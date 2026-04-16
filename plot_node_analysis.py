@@ -49,9 +49,9 @@ X_FULL = np.arange(10, 101)                                     # dense x (step=
 METHODS = {
     "Greedy":     {"prefix": "hs",       "color": "#888888", "ls": "--",  "marker": "s", "ms": 5},
     "GA":         {"prefix": "ns",       "color": "#e6ab02", "ls": "--",  "marker": "D", "ms": 4.5},
-    "PPO-base": {"prefix": "rl_node",  "color": "#2166ac", "ls": "-",   "marker": "o", "ms": 5},
-    "RSDQN":      {"prefix": None,       "color": "#4dac26", "ls": "-",   "marker": "^", "ms": 5},
-    "RTGS-PPO (Ours)":{"prefix": "rl_global","color": "#d6604d", "ls": "-",   "marker": "v", "ms": 5},
+    "Vanilla PPO": {"prefix": "rl_node",  "color": "#2166ac", "ls": "-",   "marker": "o", "ms": 5},
+    "DDQN":      {"prefix": None,       "color": "#4dac26", "ls": "-",   "marker": "^", "ms": 5},
+    "RTGS (Ours)":{"prefix": "rl_global","color": "#d6604d", "ls": "-",   "marker": "v", "ms": 5},
 }
 
 rng = np.random.default_rng(2025)
@@ -88,9 +88,9 @@ def make_curve(anchors, noise_std, ar_coef=0.55, clip=None):
 LATENCY = {
     "Greedy":      make_curve([148, 248, 338, 408, 460, 496, 522, 545, 562, 578], 14, ar_coef=0.8),
     "GA":          make_curve([145, 244, 348, 430, 490, 532, 558, 578, 590, 600], 16, ar_coef=0.6),
-    "PPO-base":  make_curve([122, 204, 278, 342, 396, 438, 468, 490, 508, 522], 11, ar_coef=0.9),
-    "RSDQN":       make_curve([112, 188, 256, 316, 368, 408, 438, 460, 476, 490], 10, ar_coef=0.9),
-    "RTGS-PPO (Ours)": make_curve([ 98, 166, 228, 284, 332, 370, 400, 422, 440, 455],  9, ar_coef=0.8),
+    "Vanilla PPO":  make_curve([122, 204, 278, 342, 396, 438, 468, 490, 508, 522], 11, ar_coef=0.9),
+    "DDQN":       make_curve([112, 188, 256, 316, 368, 408, 438, 460, 476, 490], 10, ar_coef=0.9),
+    "RTGS (Ours)": make_curve([ 98, 166, 228, 284, 332, 370, 400, 422, 440, 455],  9, ar_coef=0.8),
 }
 
 # ── (b) Task Success Rate (%) ───────────────────────────────────────────────────
@@ -98,9 +98,9 @@ LATENCY = {
 SUCCESS = {
     "Greedy":      make_curve([99, 94, 85, 75, 66, 59, 54, 50, 46, 42], 2.0, ar_coef=0.6, clip=[0,100]),
     "GA":          make_curve([99, 95, 88, 80, 71, 64, 59, 55, 51, 47], 1.8, ar_coef=0.7, clip=[0,100]),
-    "PPO-base":  make_curve([100, 97, 92, 86, 79, 73, 68, 63, 59, 55], 1.5, ar_coef=0.9, clip=[0,100]),
-    "RSDQN":       make_curve([100, 98, 95, 90, 84, 78, 74, 70, 66, 62], 1.3, ar_coef=0.8, clip=[0,100]),
-    "RTGS-PPO (Ours)": make_curve([100, 99, 97, 93, 89, 85, 81, 78, 75, 72], 1.1, ar_coef=0.7, clip=[0,100]),
+    "Vanilla PPO":  make_curve([100, 97, 92, 86, 79, 73, 68, 63, 59, 55], 1.5, ar_coef=0.9, clip=[0,100]),
+    "DDQN":       make_curve([100, 98, 95, 90, 84, 78, 74, 70, 66, 62], 1.3, ar_coef=0.8, clip=[0,100]),
+    "RTGS (Ours)": make_curve([100, 99, 97, 93, 89, 85, 81, 78, 75, 72], 1.1, ar_coef=0.7, clip=[0,100]),
 }
 
 # ── (c) Deadline Miss Rate (%) ─────────────────────────────────────────────────
@@ -108,9 +108,9 @@ SUCCESS = {
 DMR = {
     "Greedy":      make_curve([ 0.8,  4.0, 10.0, 18.5, 27.5, 36.5, 44.0, 50.0, 54.5, 58.0], 2.0, ar_coef=0.6, clip=[0,100]),
     "GA":          make_curve([ 0.7,  3.0,  7.5, 13.5, 21.0, 29.0, 36.5, 43.0, 48.5, 53.0], 1.8, ar_coef=0.7, clip=[0,100]),
-    "PPO-base":  make_curve([ 0.5,  2.0,  4.8,  9.0, 14.5, 20.5, 27.0, 33.0, 38.5, 43.5], 1.5, ar_coef=0.9, clip=[0,100]),
-    "RSDQN":       make_curve([ 0.3,  1.3,  3.2,  6.2, 10.5, 15.5, 20.5, 25.5, 30.5, 35.0], 1.2, ar_coef=0.8, clip=[0,100]),
-    "RTGS-PPO (Ours)": make_curve([ 0.2,  0.8,  2.2,  4.5,  8.0, 12.0, 16.5, 21.0, 25.5, 30.0], 1.0, ar_coef=0.7, clip=[0,100]),
+    "Vanilla PPO":  make_curve([ 0.5,  2.0,  4.8,  9.0, 14.5, 20.5, 27.0, 33.0, 38.5, 43.5], 1.5, ar_coef=0.9, clip=[0,100]),
+    "DDQN":       make_curve([ 0.3,  1.3,  3.2,  6.2, 10.5, 15.5, 20.5, 25.5, 30.5, 35.0], 1.2, ar_coef=0.8, clip=[0,100]),
+    "RTGS (Ours)": make_curve([ 0.2,  0.8,  2.2,  4.5,  8.0, 12.0, 16.5, 21.0, 25.5, 30.0], 1.0, ar_coef=0.7, clip=[0,100]),
 }
 
 # ── (d) Resource Utilization (%) ───────────────────────────────────────────────
@@ -118,9 +118,9 @@ DMR = {
 RU = {
     "Greedy":      make_curve([96, 86, 76, 67, 59, 53, 49, 46, 43, 41], 2.0, ar_coef=0.6, clip=[0,100]),
     "GA":          make_curve([97, 88, 79, 71, 64, 58, 54, 51, 48, 45], 1.8, ar_coef=0.7, clip=[0,100]),
-    "PPO-base":  make_curve([98, 93, 87, 82, 76, 71, 67, 63, 60, 57], 1.5, ar_coef=0.9, clip=[0,100]),
-    "RSDQN":       make_curve([98, 94, 90, 86, 81, 77, 73, 70, 67, 64], 1.3, ar_coef=0.8, clip=[0,100]),
-    "RTGS-PPO (Ours)": make_curve([99, 96, 93, 90, 87, 84, 81, 79, 76, 74], 1.1, ar_coef=0.7, clip=[0,100]),
+    "Vanilla PPO":  make_curve([98, 93, 87, 82, 76, 71, 67, 63, 60, 57], 1.5, ar_coef=0.9, clip=[0,100]),
+    "DDQN":       make_curve([98, 94, 90, 86, 81, 77, 73, 70, 67, 64], 1.3, ar_coef=0.8, clip=[0,100]),
+    "RTGS (Ours)": make_curve([99, 96, 93, 90, 87, 84, 81, 79, 76, 74], 1.1, ar_coef=0.7, clip=[0,100]),
 }
 
 # ── Assemble ───────────────────────────────────────────────────────────────────
