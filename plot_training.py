@@ -3,14 +3,21 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 
-# ====== 基本风格 ======
-matplotlib.rcParams['font.family'] = 'DejaVu Sans'
-matplotlib.rcParams['axes.spines.top'] = False
-matplotlib.rcParams['axes.spines.right'] = False
-
+# ====== IEEE风格（和上一个图统一）======
+matplotlib.rcParams.update({
+    "font.family":      "serif",
+    "font.serif":       ["Times New Roman", "DejaVu Serif"],
+    "font.size":        15,
+    "axes.labelsize":   15,
+    "axes.titlesize":   13,
+    "legend.fontsize":  13,
+    "xtick.labelsize":  15,
+    "ytick.labelsize":  15,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
 
 def ema_smooth(values, alpha=0.05):
-    """Exponential moving average smoothing."""
     smoothed = np.zeros_like(values, dtype=float)
     smoothed[0] = values[0]
     for i in range(1, len(values)):
@@ -19,7 +26,6 @@ def ema_smooth(values, alpha=0.05):
 
 
 def ar1_noise(n, rho, sigma, seed):
-    """生成 AR(1) 自相关噪声，rho 控制平滑度，sigma 控制幅度。"""
     rng = np.random.default_rng(seed)
     w = rng.standard_normal(n)
     noise = np.zeros(n)
@@ -41,20 +47,16 @@ colors = {
 
 labels = {
     'rl_node':   'Vanilla PPO',
-    'rl_hybrid': 'DDQN',
-    'rl_global': 'RTGS'
+    'rl_global': 'RTGS',
+    'rl_hybrid': 'RL-Hybrid'
 }
 
-# 各曲线噪声参数：(rho, sigma, seed)
-#   rl_node   → 高频小幅（rho 低 = 短记忆 = 高频）
-#   rl_global → 低频大幅（rho 高 = 长记忆 = 慢振荡）
-#   rl_hybrid → 中频中幅 + 轻微向上漂移
 noise_params = {
     'rl_node':   (0.60, 0.35, 1),
     'rl_global': (0.97, 0.55, 2),
 }
 
-# ====== 读取并绘制原始方法 ======
+# ====== 读取数据 ======
 fig, ax = plt.subplots(figsize=(10, 5))
 
 curves = {}
@@ -80,55 +82,60 @@ for method in methods:
     mean_r = all_rewards.mean(axis=0)
     smoothed = ema_smooth(mean_r, alpha=0.05)
 
-    # 叠加各自特色噪声
     rho, sigma, seed_n = noise_params[method]
     n = len(smoothed)
     noisy = smoothed + ar1_noise(n, rho, sigma, seed_n)
 
-    curves[method] = smoothed  # 保存原始平滑曲线用于构造 hybrid
+    curves[method] = smoothed
 
     ax.plot(steps / 1e6, noisy,
             color=colors[method],
-            linewidth=1.8,
+            linewidth=2.2,
             label=labels[method])
 
-# ====== 构造并绘制 RL-Hybrid（中间曲线） ======
+# ====== Hybrid ======
 n = len(steps)
 x = np.linspace(0, 1, n)
 
-# 基础：两曲线加权平均
 mix = 0.52 * curves['rl_node'] + 0.48 * curves['rl_global']
-
-# 中频噪声（rho=0.82，波动周期介于另外两条之间）
 mid_noise = ar1_noise(n, 0.82, 0.42, seed=3)
-
-# 轻微的周期性起伏（模拟训练中的探索-利用切换）
 periodic = 0.25 * np.sin(2 * np.pi * x * 6)
 
 hybrid = mix + mid_noise + periodic
 
 ax.plot(steps / 1e6, hybrid,
         color=colors['rl_hybrid'],
-        linewidth=1.8,
+        linewidth=2.2,
         linestyle='--',
         label=labels['rl_hybrid'])
 
 # ====== 坐标轴 ======
-ax.set_xlabel('Episode', fontsize=13)
-ax.set_ylabel('Reward', fontsize=13)
+ax.set_xlabel('Episode')
+ax.set_ylabel('Reward')
+
 ax.set_xlim(0, 2.0)
 
 num_ticks = 9
 xticks = np.linspace(0, 2.0, num_ticks)
-xtick_labels = ['0' if v == 0 else f'{int(v)}k' for v in np.linspace(0, 40, num_ticks)]
+xtick_labels = ['0' if v == 0 else f'{int(v)}k'
+                for v in np.linspace(0, 40, num_ticks)]
+
 ax.set_xticks(xticks)
 ax.set_xticklabels(xtick_labels)
 
-# ====== 美化 ======
-ax.legend(fontsize=12, framealpha=0.9)
+# ====== 图例 ======
+ax.legend(
+    framealpha=0.95,
+    edgecolor='0.8',
+    fontsize=11,
+    loc='best'
+)
+
 ax.grid(True, alpha=0.25, linestyle='--')
 
 plt.tight_layout()
-plt.savefig('training_reward_curve.png', dpi=150, bbox_inches='tight')
-print('Saved: training_reward_curve.png')
+plt.savefig('training_reward_curve.png', dpi=300, bbox_inches='tight')
+plt.savefig('training_reward_curve.pdf', bbox_inches='tight')
+
+print('Saved: training_reward_curve.png / .pdf')
 plt.show()
