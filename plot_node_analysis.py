@@ -124,7 +124,7 @@ def plot_panel(ax, key, ylabel, title):
                 lw=1.4,            # thicker line
                 label=name)
 
-    ax.set_title(title)
+    ax.set_title(title, fontweight="bold")
     ax.set_xlabel("DAG Node Number")
     ax.set_ylabel(ylabel)
 
