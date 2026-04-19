@@ -34,11 +34,11 @@ X_MID  = np.array([10,20,30,40,50,60,70,80,90,100])
 X_FULL = np.arange(10, 101)
 
 METHODS = {
-    "Greedy":      {"color": "#888888", "ls": "--", "marker": "s"},
-    "GA":          {"color": "#e6ab02", "ls": "--", "marker": "D"},
-    "Vanilla PPO": {"color": "#2166ac", "ls": "-",  "marker": "o"},
-    "DDQN":        {"color": "#4dac26", "ls": "-",  "marker": "^"},
-    "RTGS (Ours)": {"color": "#d6604d", "ls": "-",  "marker": "v"},
+    "Greedy":      {"color": "#888888", "ls": ":",   "marker": "s"},  # 点线
+    "GA":          {"color": "#e6ab02", "ls": ":",   "marker": "^"},  # 点划线
+    "Vanilla PPO": {"color": "#2166ac", "ls": "--",  "marker": "o"},  # 虚线
+    "DDQN":        {"color": "#4dac26", "ls": "--",  "marker": "D"},  # 虚线
+    "RTGS (Ours)": {"color": "#d6604d", "ls": "-",   "marker": "v"},  # 实线
 }
 
 rng = np.random.default_rng(2025)

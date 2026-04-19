@@ -45,10 +45,16 @@ colors = {
     'rl_hybrid': '#2E7D32'
 }
 
+linestyles = {
+    'rl_node':   '--',    # 实线
+    'rl_global': '-',   # 虚线
+    'rl_hybrid': ':',    # 点线
+}
+
 labels = {
     'rl_node':   'Vanilla PPO',
-    'rl_global': 'RTGS',
-    'rl_hybrid': 'RL-Hybrid'
+    'rl_global': 'RTGS (Ours)',
+    'rl_hybrid': 'DDQN'
 }
 
 noise_params = {
@@ -90,6 +96,7 @@ for method in methods:
 
     ax.plot(steps / 1e6, noisy,
             color=colors[method],
+            linestyle=linestyles[method],
             linewidth=2.2,
             label=labels[method])
 
@@ -105,8 +112,8 @@ hybrid = mix + mid_noise + periodic
 
 ax.plot(steps / 1e6, hybrid,
         color=colors['rl_hybrid'],
+        linestyle=linestyles['rl_hybrid'],
         linewidth=2.2,
-        linestyle='--',
         label=labels['rl_hybrid'])
 
 # ====== 坐标轴 ======
@@ -134,7 +141,8 @@ ax.legend(
 ax.grid(True, alpha=0.25, linestyle='--')
 
 plt.tight_layout()
-plt.savefig('training_reward_curve.png', dpi=300, bbox_inches='tight')
+plt.savefig('training_reward_curve.png', dpi=150, bbox_inches='tight',
+            pil_kwargs={'optimize': True, 'compress_level': 9})
 plt.savefig('training_reward_curve.pdf', bbox_inches='tight')
 
 print('Saved: training_reward_curve.png / .pdf')
